@@ -1,5 +1,7 @@
 # Odoo Developer Assistant MCP
 
+[![CI](https://github.com/pks0204/odoo-developer-assistant-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/pks0204/odoo-developer-assistant-mcp/actions/workflows/ci.yml)
+
 An MCP (Model Context Protocol) server that helps Odoo developers investigate common errors, inspect custom addons, and validate module manifests.
 
 The project provides initial troubleshooting suggestions and static validation. It does not modify an Odoo database or claim that a suggested diagnosis is confirmed.
@@ -126,6 +128,9 @@ The `tests/fixtures/` directory provides sample XML view files (`valid_view.xml`
 
 ```text
 odoo-developer-assistant/
+├── .github/
+│   └── workflows/
+│       └── ci.yml
 ├── .gitignore
 ├── README.md
 ├── pytest.ini
