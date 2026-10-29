@@ -101,6 +101,18 @@ Capabilities include:
 - **Cross-File Consistency Audit**: Cross-references models, views, and security files within the addon to detect custom models missing security access rules and XML view `<field>` tags referencing undeclared model fields.
 - **Consolidated Health Scoring**: Assigns an overall status (`HEALTHY`, `NEEDS_ATTENTION`, `CRITICAL_ISSUES`) with file counts, error/warning summaries, cross-file issues, and prioritized action suggestions.
 
+### 8. Live Odoo Metadata Verifier
+
+The `verify_odoo_live_metadata` tool enables developers to connect to an active Odoo instance (local development Docker, test instance, or staging server) via read-only XML-RPC to dynamically verify models, fields, and external XML IDs before deployment.
+
+Capabilities include:
+- **Model Verification**: Queries `ir.model` to check whether referenced models exist in the target database.
+- **Field Verification**: Queries `ir.model.fields` to verify that field names, types (`ttype`), and attributes exist on the target model.
+- **External XML ID Verification**: Queries `ir.model.data` to verify external IDs (e.g. `base.group_user`, `sale.action_orders`).
+- **Read-Only Safety**: Strictly executes read-only `search_read` calls; never writes to or modifies the database.
+- **Credential Protection**: Passwords and API keys are never leaked or stored in responses.
+- **Zero Dependencies**: Powered exclusively by Python's standard library `xmlrpc.client`.
+
 ## Requirements
 
 - Python 3.12 or a compatible Python version
@@ -138,7 +150,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 90 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, unified health check, entry points, and edge cases.
+The current test suite contains 98 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -255,14 +267,13 @@ odoo-developer-assistant/
 - Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
 - Security analysis is static. It verifies CSV access rule syntax, model ID prefixes, and XML record rule definitions, but does not confirm whether referenced security groups exist in an active Odoo database.
 - The unified addon health check performs static analysis across files; complete behavioral verification requires testing the addon inside an active Odoo runtime environment.
-- The tools do not currently connect to or modify an Odoo database.
+- The tools do not modify an Odoo database (live inspection via `verify_odoo_live_metadata` is strictly read-only).
 
 ## Future Improvements
 
-- Recognize additional Odoo error patterns.
-- Cross-file consistency analysis (e.g. checking XML view field references against declared model fields).
-- Expand automated tests for unusual and invalid inputs.
-- Add optional live Odoo XML-RPC metadata introspection.
+- Recognize additional Odoo error patterns and OWL UI tracebacks.
+- Support batch live metadata verification for large enterprise schemas.
+- Expand automated tests for unusual and edge-case inputs.
 
 ## License
 

@@ -3,7 +3,10 @@ import csv
 import io
 from pathlib import Path
 import re
+import socket
+import urllib.parse
 import xml.sax
+import xmlrpc.client
 
 from mcp.server import MCPServer
 
@@ -2148,6 +2151,325 @@ def check_odoo_addon_health(
         },
         "suggestions": suggestions,
     }
+
+def _get_server_proxy(endpoint: str, timeout: int = 10) -> xmlrpc.client.ServerProxy:
+    """Create an XML-RPC ServerProxy with custom socket timeout."""
+    if endpoint.startswith("https://"):
+        class SafeTimeoutTransport(xmlrpc.client.SafeTransport):
+            def make_connection(self, host):
+                conn = super().make_connection(host)
+                conn.timeout = timeout
+                return conn
+        transport = SafeTimeoutTransport()
+    else:
+        class TimeoutTransport(xmlrpc.client.Transport):
+            def make_connection(self, host):
+                conn = super().make_connection(host)
+                conn.timeout = timeout
+                return conn
+        transport = TimeoutTransport()
+    return xmlrpc.client.ServerProxy(endpoint, transport=transport, allow_none=True)
+
+
+@mcp.tool()
+def verify_odoo_live_metadata(
+    url: str,
+    db: str,
+    username: str,
+    password: str,
+    models_to_check: list[str] | None = None,
+    fields_to_check: dict[str, list[str]] | None = None,
+    xml_ids_to_check: list[str] | None = None,
+    timeout: int = 10,
+) -> dict:
+    """Connect to a running Odoo instance via read-only XML-RPC to dynamically
+    verify whether models, model fields, and external XML IDs exist in the active database.
+
+    Args:
+        url: URL of the Odoo instance (e.g. 'http://localhost:8069' or 'https://myodoo.example.com').
+        db: Name of the Odoo database.
+        username: User login name / email.
+        password: User password or API key.
+        models_to_check: Optional list of model names to verify (e.g. ['sale.order', 'res.partner']).
+        fields_to_check: Optional mapping of model names to lists of field names to verify (e.g. {'sale.order': ['partner_id', 'custom_ref']}).
+        xml_ids_to_check: Optional list of external XML IDs to verify (e.g. ['base.group_user', 'sale.action_orders']).
+        timeout: Network timeout in seconds (default: 10).
+    """
+    if not isinstance(url, str) or not url.strip():
+        return {
+            "success": False,
+            "error": "Please provide a valid Odoo URL as text.",
+        }
+
+    if not isinstance(db, str) or not db.strip():
+        return {
+            "success": False,
+            "error": "Please provide a non-empty database name.",
+        }
+
+    if not isinstance(username, str) or not username.strip():
+        return {
+            "success": False,
+            "error": "Please provide a non-empty username.",
+        }
+
+    if not isinstance(password, str) or not password:
+        return {
+            "success": False,
+            "error": "Please provide a non-empty password or API key.",
+        }
+
+    if models_to_check is not None and (
+        not isinstance(models_to_check, list)
+        or not all(isinstance(m, str) for m in models_to_check)
+    ):
+        return {
+            "success": False,
+            "error": "models_to_check must be a list of model name strings.",
+        }
+
+    if fields_to_check is not None and (
+        not isinstance(fields_to_check, dict)
+        or not all(
+            isinstance(k, str)
+            and isinstance(v, list)
+            and all(isinstance(f, str) for f in v)
+            for k, v in fields_to_check.items()
+        )
+    ):
+        return {
+            "success": False,
+            "error": "fields_to_check must be a dictionary mapping model names to lists of field name strings.",
+        }
+
+    if xml_ids_to_check is not None and (
+        not isinstance(xml_ids_to_check, list)
+        or not all(isinstance(x, str) for x in xml_ids_to_check)
+    ):
+        return {
+            "success": False,
+            "error": "xml_ids_to_check must be a list of XML ID strings.",
+        }
+
+    if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 60:
+        return {
+            "success": False,
+            "error": "timeout must be a positive number up to 60 seconds.",
+        }
+
+    parsed_url = urllib.parse.urlparse(url.strip())
+    if parsed_url.scheme not in ("http", "https") or not parsed_url.netloc:
+        return {
+            "success": False,
+            "error": "Invalid Odoo URL. Please provide an HTTP or HTTPS URL (e.g. 'http://localhost:8069').",
+        }
+
+    clean_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    if parsed_url.path and parsed_url.path != "/":
+        clean_url += parsed_url.path.rstrip("/")
+
+    # 1. Authenticate against /xmlrpc/2/common
+    try:
+        common = _get_server_proxy(f"{clean_url}/xmlrpc/2/common", timeout=int(timeout))
+        uid = common.authenticate(db.strip(), username.strip(), password, {})
+    except (OSError, socket.timeout, ConnectionRefusedError) as exc:
+        return {
+            "success": False,
+            "error_type": "CONNECTION_ERROR",
+            "error": f"Failed to connect to Odoo instance at {clean_url}: {exc}",
+        }
+    except xmlrpc.client.Fault as exc:
+        return {
+            "success": False,
+            "error_type": "XMLRPC_FAULT",
+            "error": f"Odoo server returned an error: {exc.faultString}",
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error_type": "UNKNOWN_ERROR",
+            "error": f"Unexpected error connecting to Odoo: {exc}",
+        }
+
+    if not uid:
+        return {
+            "success": True,
+            "authenticated": False,
+            "error": f"Authentication failed for user '{username}' on database '{db}'.",
+            "suggestions": [
+                "Verify that the database name, username, and password / API key are correct.",
+                "Ensure the user has access to database and XML-RPC web services are enabled.",
+            ],
+        }
+
+    # 2. Connect to /xmlrpc/2/object
+    try:
+        models_proxy = _get_server_proxy(f"{clean_url}/xmlrpc/2/object", timeout=int(timeout))
+    except Exception as exc:
+        return {
+            "success": False,
+            "error_type": "CONNECTION_ERROR",
+            "error": f"Failed to initialize object endpoint: {exc}",
+        }
+
+    # 3. Query Models
+    models_status = {}
+    if models_to_check:
+        try:
+            records = models_proxy.execute_kw(
+                db.strip(), uid, password,
+                "ir.model", "search_read",
+                [[["model", "in", models_to_check]]],
+                {"fields": ["model", "name", "state"]},
+            )
+            found_dict = {r["model"]: r for r in records}
+            for m in models_to_check:
+                if m in found_dict:
+                    models_status[m] = {
+                        "exists": True,
+                        "name": found_dict[m].get("name"),
+                        "state": found_dict[m].get("state"),
+                    }
+                else:
+                    models_status[m] = {"exists": False}
+        except Exception as exc:
+            models_status = {"error": f"Failed to query ir.model: {exc}"}
+
+    # 4. Query Fields
+    fields_status = {}
+    if fields_to_check:
+        for m_name, f_list in fields_to_check.items():
+            try:
+                records = models_proxy.execute_kw(
+                    db.strip(), uid, password,
+                    "ir.model.fields", "search_read",
+                    [[["model", "=", m_name], ["name", "in", f_list]]],
+                    {"fields": ["name", "ttype", "field_description", "required", "readonly"]},
+                )
+                found_fields = {r["name"]: r for r in records}
+                field_res = {}
+                for fn in f_list:
+                    if fn in found_fields:
+                        rec = found_fields[fn]
+                        field_res[fn] = {
+                            "exists": True,
+                            "type": rec.get("ttype"),
+                            "description": rec.get("field_description"),
+                            "required": rec.get("required"),
+                            "readonly": rec.get("readonly"),
+                        }
+                    else:
+                        field_res[fn] = {"exists": False}
+                fields_status[m_name] = field_res
+            except Exception as exc:
+                fields_status[m_name] = {"error": f"Failed to query fields for {m_name}: {exc}"}
+
+    # 5. Query External XML IDs
+    xml_ids_status = {}
+    if xml_ids_to_check:
+        parsed_xml_ids = []
+        domain_clauses = []
+        for xid in xml_ids_to_check:
+            if "." in xid:
+                mod_name, rec_name = xid.split(".", 1)
+            else:
+                mod_name, rec_name = "", xid
+            parsed_xml_ids.append((xid, mod_name, rec_name))
+            domain_clauses.append(["&", ["module", "=", mod_name], ["name", "=", rec_name]])
+
+        try:
+            if len(domain_clauses) == 1:
+                combined_domain = domain_clauses[0]
+            else:
+                combined_domain = []
+                for _ in range(len(domain_clauses) - 1):
+                    combined_domain.append("|")
+                for clause in domain_clauses:
+                    combined_domain.extend(clause)
+
+            records = models_proxy.execute_kw(
+                db.strip(), uid, password,
+                "ir.model.data", "search_read",
+                [combined_domain],
+                {"fields": ["module", "name", "model", "res_id"]},
+            )
+            found_xids = {}
+            for r in records:
+                full_key = f"{r['module']}.{r['name']}" if r["module"] else r["name"]
+                found_xids[full_key] = r
+
+            for xid, mod_name, rec_name in parsed_xml_ids:
+                full_key = f"{mod_name}.{rec_name}" if mod_name else rec_name
+                if full_key in found_xids:
+                    rec = found_xids[full_key]
+                    xml_ids_status[xid] = {
+                        "exists": True,
+                        "model": rec.get("model"),
+                        "res_id": rec.get("res_id"),
+                    }
+                else:
+                    xml_ids_status[xid] = {"exists": False}
+        except Exception as exc:
+            xml_ids_status = {"error": f"Failed to query ir.model.data: {exc}"}
+
+    # 6. Suggestions and Summary
+    suggestions = []
+    missing_models = [
+        m for m, stat in models_status.items()
+        if isinstance(stat, dict) and not stat.get("exists") and "error" not in stat
+    ]
+    if missing_models:
+        suggestions.append(
+            f"Models not found in database: {', '.join(missing_models)}. Ensure the required module is installed."
+        )
+
+    missing_fields = []
+    for m, f_dict in fields_status.items():
+        if isinstance(f_dict, dict) and "error" not in f_dict:
+            for fn, f_stat in f_dict.items():
+                if isinstance(f_stat, dict) and not f_stat.get("exists"):
+                    missing_fields.append(f"{m}.{fn}")
+    if missing_fields:
+        suggestions.append(
+            f"Fields not found in database: {', '.join(missing_fields)}. Check spelling or upgrade the module in Odoo."
+        )
+
+    missing_xml_ids = [
+        x for x, stat in xml_ids_status.items()
+        if isinstance(stat, dict) and not stat.get("exists") and "error" not in stat
+    ]
+    if missing_xml_ids:
+        suggestions.append(
+            f"External XML IDs not found: {', '.join(missing_xml_ids)}. Verify dependent modules are installed."
+        )
+
+    if not suggestions:
+        suggestions.append("All queried metadata verified successfully in the live Odoo database.")
+
+    total_models_checked = len(models_to_check) if models_to_check else 0
+    total_fields_checked = sum(len(fl) for fl in fields_to_check.values()) if fields_to_check else 0
+    total_xml_ids_checked = len(xml_ids_to_check) if xml_ids_to_check else 0
+
+    return {
+        "success": True,
+        "authenticated": True,
+        "database": db.strip(),
+        "user_id": uid,
+        "url": clean_url,
+        "summary": {
+            "models_checked": total_models_checked,
+            "fields_checked": total_fields_checked,
+            "xml_ids_checked": total_xml_ids_checked,
+            "missing_models": len(missing_models),
+            "missing_fields": len(missing_fields),
+            "missing_xml_ids": len(missing_xml_ids),
+        },
+        "models": models_status,
+        "fields": fields_status,
+        "xml_ids": xml_ids_status,
+        "suggestions": suggestions,
+    }
+
 
 def main() -> None:
     mcp.run()

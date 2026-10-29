@@ -11,6 +11,7 @@ from server import (
     inspect_odoo_module,
     main,
     validate_odoo_manifest,
+    verify_odoo_live_metadata,
 )
 
 
@@ -1496,3 +1497,201 @@ def test_addon_health_cross_file_consistency_breakdown_structure(tmp_path):
     assert "views_checked" in cross_sec
     assert cross_sec["new_models_checked"] == 1
     assert cross_sec["views_checked"] == 1
+
+
+def test_verify_live_metadata_invalid_url():
+    result = verify_odoo_live_metadata(
+        url="",
+        db="odoo",
+        username="admin",
+        password="secretpassword",
+    )
+    assert result["success"] is False
+    assert "url" in result["error"].lower()
+
+    result_scheme = verify_odoo_live_metadata(
+        url="ftp://odoo.local",
+        db="odoo",
+        username="admin",
+        password="secretpassword",
+    )
+    assert result_scheme["success"] is False
+    assert "http" in result_scheme["error"].lower()
+
+
+def test_verify_live_metadata_invalid_params():
+    result = verify_odoo_live_metadata(
+        url="http://localhost:8069",
+        db="",
+        username="admin",
+        password="secretpassword",
+    )
+    assert result["success"] is False
+    assert "database" in result["error"].lower()
+
+    result_models = verify_odoo_live_metadata(
+        url="http://localhost:8069",
+        db="odoo",
+        username="admin",
+        password="secretpassword",
+        models_to_check="not_a_list",
+    )
+    assert result_models["success"] is False
+    assert "models_to_check" in result_models["error"]
+
+    result_fields = verify_odoo_live_metadata(
+        url="http://localhost:8069",
+        db="odoo",
+        username="admin",
+        password="secretpassword",
+        fields_to_check=["not_a_dict"],
+    )
+    assert result_fields["success"] is False
+    assert "fields_to_check" in result_fields["error"]
+
+
+def test_verify_live_metadata_auth_failure():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = False
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="odoo",
+            username="admin",
+            password="wrongpassword",
+        )
+
+        assert result["success"] is True
+        assert result["authenticated"] is False
+        assert "Authentication failed" in result["error"]
+        assert len(result["suggestions"]) > 0
+
+
+def test_verify_live_metadata_connection_error():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.side_effect = ConnectionRefusedError("Connection refused")
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="odoo",
+            username="admin",
+            password="secretpassword",
+        )
+
+        assert result["success"] is False
+        assert result["error_type"] == "CONNECTION_ERROR"
+        assert "Failed to connect" in result["error"]
+
+
+def test_verify_live_metadata_models_found_and_missing():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2  # UID
+
+        # Mock object proxy
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.return_value = [
+            {"model": "sale.order", "name": "Sales Order", "state": "base"}
+        ]
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="odoo",
+            username="admin",
+            password="secretpassword",
+            models_to_check=["sale.order", "nonexistent.model"],
+        )
+
+        assert result["success"] is True
+        assert result["authenticated"] is True
+        assert result["summary"]["models_checked"] == 2
+        assert result["summary"]["missing_models"] == 1
+        assert result["models"]["sale.order"]["exists"] is True
+        assert result["models"]["sale.order"]["name"] == "Sales Order"
+        assert result["models"]["nonexistent.model"]["exists"] is False
+        assert any("nonexistent.model" in s for s in result["suggestions"])
+
+
+def test_verify_live_metadata_fields_found_and_missing():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.return_value = [
+            {
+                "name": "partner_id",
+                "ttype": "many2one",
+                "field_description": "Customer",
+                "required": True,
+                "readonly": False,
+            }
+        ]
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="odoo",
+            username="admin",
+            password="secretpassword",
+            fields_to_check={"sale.order": ["partner_id", "missing_field"]},
+        )
+
+        assert result["success"] is True
+        assert result["summary"]["fields_checked"] == 2
+        assert result["summary"]["missing_fields"] == 1
+        assert result["fields"]["sale.order"]["partner_id"]["exists"] is True
+        assert result["fields"]["sale.order"]["partner_id"]["type"] == "many2one"
+        assert result["fields"]["sale.order"]["missing_field"]["exists"] is False
+        assert any("missing_field" in s for s in result["suggestions"])
+
+
+def test_verify_live_metadata_xml_ids_found_and_missing():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.return_value = [
+            {
+                "module": "base",
+                "name": "group_user",
+                "model": "res.groups",
+                "res_id": 4,
+            }
+        ]
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="odoo",
+            username="admin",
+            password="secretpassword",
+            xml_ids_to_check=["base.group_user", "my_module.missing_view"],
+        )
+
+        assert result["success"] is True
+        assert result["summary"]["xml_ids_checked"] == 2
+        assert result["summary"]["missing_xml_ids"] == 1
+        assert result["xml_ids"]["base.group_user"]["exists"] is True
+        assert result["xml_ids"]["base.group_user"]["model"] == "res.groups"
+        assert result["xml_ids"]["my_module.missing_view"]["exists"] is False
+        assert any("my_module.missing_view" in s for s in result["suggestions"])
+
+
+def test_verify_live_metadata_credentials_never_leaked():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        secret = "super_secret_token_12345"
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="odoo",
+            username="admin",
+            password=secret,
+            models_to_check=["res.partner"],
+        )
+
+        result_str = str(result)
+        assert secret not in result_str
