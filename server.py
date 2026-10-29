@@ -1,4 +1,5 @@
 import ast
+import csv
 import io
 from pathlib import Path
 import re
@@ -1323,6 +1324,415 @@ def analyze_odoo_python_model(
             "info_count": len(info),
         },
         "models_found": models_found,
+        "errors": errors,
+        "warnings": warnings,
+        "info": info,
+        "suggestions": suggestions,
+    }
+
+
+MAX_SECURITY_FILE_SIZE = 500_000  # 500 KB
+EXPECTED_ACCESS_CSV_HEADERS = [
+    "id",
+    "name",
+    "model_id:id",
+    "group_id:id",
+    "perm_read",
+    "perm_write",
+    "perm_create",
+    "perm_unlink",
+]
+
+
+class _SecurityXMLContentHandler(xml.sax.ContentHandler):
+    """SAX handler to collect Odoo security records (ir.rule, res.groups)."""
+
+    def __init__(self):
+        super().__init__()
+        self.locator = None
+        self.rules = []
+        self.records = []
+        self._current_rec = None
+
+    def setDocumentLocator(self, locator):
+        self.locator = locator
+
+    def startElement(self, name, attrs):
+        line = self.locator.getLineNumber() if self.locator else None
+        if name == "record":
+            model = attrs.get("model")
+            rec_id = attrs.get("id")
+            self._current_rec = {
+                "id": rec_id,
+                "model": model,
+                "line": line,
+                "has_model_id": False,
+                "has_domain_force": False,
+            }
+            self.records.append(self._current_rec)
+            if model == "ir.rule":
+                self.rules.append(self._current_rec)
+        elif self._current_rec and name == "field":
+            fname = attrs.get("name")
+            if fname == "model_id":
+                self._current_rec["has_model_id"] = True
+            elif fname == "domain_force":
+                self._current_rec["has_domain_force"] = True
+
+    def endElement(self, name):
+        if name == "record":
+            self._current_rec = None
+
+
+@mcp.tool()
+def analyze_odoo_security(
+    file_path: str,
+    addon_path: str | None = None,
+) -> dict:
+    """Analyze an Odoo security file (ir.model.access.csv or security XML data)
+    for syntax mistakes, invalid headers, missing model prefixes, and misconfigured rules.
+
+    Args:
+        file_path: Absolute or relative path to the security file (.csv or .xml).
+        addon_path: Optional path to the containing addon directory to enforce
+            sandboxed file access.
+    """
+    if not isinstance(file_path, str) or not file_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide a security file path as text.",
+        }
+
+    try:
+        resolved_file = Path(file_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid file path: {exc}",
+        }
+
+    if addon_path is not None:
+        if not isinstance(addon_path, str) or not addon_path.strip():
+            return {
+                "success": False,
+                "error": "addon_path must be a non-empty string when provided.",
+            }
+        try:
+            resolved_addon = Path(addon_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Invalid addon path: {exc}",
+            }
+
+        if not resolved_addon.is_dir():
+            return {
+                "success": False,
+                "error": f"Addon directory does not exist: {resolved_addon}",
+            }
+
+        if not resolved_file.is_relative_to(resolved_addon):
+            return {
+                "success": False,
+                "error": (
+                    "The security file must reside inside the supplied addon directory."
+                ),
+            }
+
+    if not resolved_file.exists():
+        return {
+            "success": False,
+            "error": f"Security file does not exist: {resolved_file}",
+        }
+
+    if not resolved_file.is_file():
+        return {
+            "success": False,
+            "error": f"Path is a directory or not a regular file: {resolved_file}",
+        }
+
+    try:
+        file_size = resolved_file.stat().st_size
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to access security file: {exc}",
+        }
+
+    if file_size > MAX_SECURITY_FILE_SIZE:
+        return {
+            "success": False,
+            "error": (
+                f"Security file is too large to inspect ({file_size} bytes). "
+                f"Maximum allowed size is {MAX_SECURITY_FILE_SIZE} bytes."
+            ),
+        }
+
+    try:
+        content = resolved_file.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to decode security file as UTF-8: {exc}",
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to read security file: {exc}",
+        }
+
+    if not content.strip():
+        return {
+            "success": True,
+            "valid": False,
+            "file": str(resolved_file),
+            "file_type": "unknown",
+            "summary": {
+                "total_rules": 0,
+                "error_count": 1,
+                "warning_count": 0,
+                "info_count": 0,
+            },
+            "rules_found": [],
+            "errors": [
+                {
+                    "code": "EMPTY_SECURITY_FILE",
+                    "message": "The security file is empty.",
+                    "line": 1,
+                    "element": None,
+                }
+            ],
+            "warnings": [],
+            "info": [],
+            "suggestions": [
+                "Provide valid security CSV access rules or XML record rules."
+            ],
+        }
+
+    is_xml = resolved_file.suffix.lower() == ".xml" or content.lstrip().startswith("<")
+    file_type = "xml" if is_xml else "csv"
+
+    errors = []
+    warnings = []
+    info = []
+    suggestions = []
+    rules_found = []
+
+    if is_xml:
+        handler = _SecurityXMLContentHandler()
+        parser = xml.sax.make_parser()
+        parser.setFeature(xml.sax.handler.feature_external_ges, False)
+        parser.setFeature(xml.sax.handler.feature_external_pes, False)
+        parser.setContentHandler(handler)
+
+        try:
+            parser.parse(io.StringIO(content))
+        except xml.sax.SAXParseException as exc:
+            return {
+                "success": True,
+                "valid": False,
+                "file": str(resolved_file),
+                "file_type": "xml",
+                "summary": {
+                    "total_rules": 0,
+                    "error_count": 1,
+                    "warning_count": 0,
+                    "info_count": 0,
+                },
+                "rules_found": [],
+                "errors": [
+                    {
+                        "code": "XML_SYNTAX_ERROR",
+                        "message": f"XML syntax error: {exc.getMessage()}",
+                        "line": exc.getLineNumber(),
+                        "column": exc.getColumnNumber(),
+                        "element": None,
+                    }
+                ],
+                "warnings": [],
+                "info": [],
+                "suggestions": [
+                    f"Check XML tag nesting and closing tags around line {exc.getLineNumber()}."
+                ],
+            }
+
+        seen_ids = {}
+        for rec in handler.records:
+            rec_id = rec.get("id")
+            rec_model = rec.get("model")
+            rec_line = rec.get("line")
+
+            if rec_id:
+                if rec_id in seen_ids:
+                    errors.append({
+                        "code": "DUPLICATE_RECORD_ID",
+                        "message": (
+                            f"Duplicate record ID '{rec_id}' found (first defined at line {seen_ids[rec_id]})."
+                        ),
+                        "line": rec_line,
+                        "element": "record",
+                    })
+                else:
+                    seen_ids[rec_id] = rec_line
+
+            if rec_model == "ir.rule":
+                rules_found.append({
+                    "id": rec_id,
+                    "name": rec_id,
+                    "model": "ir.rule",
+                    "line": rec_line,
+                })
+                if not rec.get("has_model_id"):
+                    errors.append({
+                        "code": "MISSING_RULE_MODEL",
+                        "message": (
+                            f"Record rule '{rec_id or 'unnamed'}' is missing a required 'model_id' field."
+                        ),
+                        "line": rec_line,
+                        "element": "record",
+                    })
+                if not rec.get("has_domain_force"):
+                    warnings.append({
+                        "code": "MISSING_RULE_DOMAIN",
+                        "message": (
+                            f"Record rule '{rec_id or 'unnamed'}' does not define a 'domain_force' filter."
+                        ),
+                        "line": rec_line,
+                        "element": "record",
+                    })
+
+    else:
+        # CSV mode: ir.model.access.csv
+        reader = csv.reader(io.StringIO(content))
+        headers = None
+        seen_ids = {}
+
+        for line_num, row in enumerate(reader, start=1):
+            if not row or not any(field.strip() for field in row):
+                continue
+
+            if headers is None:
+                headers = [c.strip() for c in row]
+                if headers != EXPECTED_ACCESS_CSV_HEADERS:
+                    errors.append({
+                        "code": "INVALID_CSV_HEADER",
+                        "message": (
+                            f"CSV header mismatch. Expected: {', '.join(EXPECTED_ACCESS_CSV_HEADERS)}. "
+                            f"Found: {', '.join(headers)}"
+                        ),
+                        "line": line_num,
+                        "element": "header",
+                    })
+                continue
+
+            if len(row) != len(EXPECTED_ACCESS_CSV_HEADERS):
+                errors.append({
+                    "code": "ROW_COLUMN_MISMATCH",
+                    "message": (
+                        f"Row has {len(row)} columns, expected {len(EXPECTED_ACCESS_CSV_HEADERS)}."
+                    ),
+                    "line": line_num,
+                    "element": "row",
+                })
+                continue
+
+            row_id = row[0].strip()
+            row_name = row[1].strip()
+            row_model = row[2].strip()
+            row_group = row[3].strip()
+            perms = [row[4].strip(), row[5].strip(), row[6].strip(), row[7].strip()]
+
+            if not row_id:
+                errors.append({
+                    "code": "MISSING_ACCESS_ID",
+                    "message": "Access rule row is missing a required 'id'.",
+                    "line": line_num,
+                    "element": "id",
+                })
+            elif row_id in seen_ids:
+                errors.append({
+                    "code": "DUPLICATE_ACCESS_ID",
+                    "message": (
+                        f"Duplicate access ID '{row_id}' found (first defined at line {seen_ids[row_id]})."
+                    ),
+                    "line": line_num,
+                    "element": "id",
+                })
+            else:
+                seen_ids[row_id] = line_num
+
+            # Validate model_id prefix
+            last_model_part = row_model.split(".")[-1]
+            if not last_model_part.startswith("model_"):
+                errors.append({
+                    "code": "MISSING_MODEL_PREFIX",
+                    "message": (
+                        f"model_id:id '{row_model}' is missing the required 'model_' prefix. "
+                        f"Example: 'model_{row_model.replace('.', '_')}'."
+                    ),
+                    "line": line_num,
+                    "element": "model_id:id",
+                })
+
+            # Validate permission flags
+            perm_names = ["perm_read", "perm_write", "perm_create", "perm_unlink"]
+            for p_name, p_val in zip(perm_names, perms):
+                if p_val not in ("0", "1"):
+                    errors.append({
+                        "code": "INVALID_PERMISSION_FLAG",
+                        "message": (
+                            f"Column '{p_name}' has invalid value '{p_val}'. Permissions must strictly be '0' or '1'."
+                        ),
+                        "line": line_num,
+                        "element": p_name,
+                    })
+
+            if not row_group:
+                info.append({
+                    "code": "GLOBAL_ACCESS_NOTICE",
+                    "message": (
+                        f"Access rule '{row_id or 'unnamed'}' has an empty group_id:id and applies globally to all users."
+                    ),
+                    "line": line_num,
+                    "rule": row_id,
+                })
+
+            rules_found.append({
+                "id": row_id,
+                "name": row_name,
+                "model": row_model,
+                "group": row_group,
+                "perm": ",".join(perms),
+                "line": line_num,
+            })
+
+    valid = len(errors) == 0
+
+    if errors:
+        suggestions.append(
+            "Resolve security access and rule errors to prevent AccessError or module installation failures."
+        )
+    if warnings:
+        suggestions.append(
+            "Review security warnings to verify record-level domain filters."
+        )
+    if valid and not warnings:
+        suggestions.append(
+            "The security file passed static checks. Actual access rights depend on installed groups in Odoo."
+        )
+
+    return {
+        "success": True,
+        "valid": valid,
+        "file": str(resolved_file),
+        "file_type": file_type,
+        "summary": {
+            "total_rules": len(rules_found),
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "info_count": len(info),
+        },
+        "rules_found": rules_found,
         "errors": errors,
         "warnings": warnings,
         "info": info,

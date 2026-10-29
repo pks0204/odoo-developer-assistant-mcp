@@ -75,6 +75,20 @@ Capabilities include:
 - **Decorator Diagnostics**: Flags `@api.depends()`, `@api.onchange()`, or `@api.constrains()` decorators with empty arguments.
 - **File Safety**: Enforces a 500 KB maximum file size limit, handles encoding gracefully, and supports optional `addon_path` sandboxing.
 
+### 6. Odoo Security Analyzer
+
+The `analyze_odoo_security` tool inspects Odoo security files (`ir.model.access.csv` and security XML records) to detect syntax mistakes, missing model prefixes, invalid permission flags, and malformed rules before module loading.
+
+Capabilities include:
+
+- **Exact CSV Header Verification**: Verifies the strict 8-column header (`id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink`).
+- **Model ID Prefix Validation**: Checks that `model_id:id` has the mandatory `model_` prefix (e.g. `model_custom_order`, not `custom.order`).
+- **Binary Permission Flags**: Validates that all permission columns (`perm_read`, `perm_write`, `perm_create`, `perm_unlink`) are strictly `0` or `1`.
+- **Integrity Checks**: Detects duplicate access rule IDs and column count mismatches.
+- **Global Rule Detection**: Identifies rules with empty `group_id:id` that grant global permissions across all users.
+- **Security XML Analysis**: Validates `ir.rule` record definitions to ensure `model_id` and `domain_force` are declared.
+
+
 
 
 ## Requirements
@@ -114,7 +128,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 54 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, and edge cases.
+The current test suite contains 69 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, and edge cases.
 
 ## Run with MCP Inspector
 
@@ -136,7 +150,7 @@ The `sample_addons/my_custom_module` directory contains a sample manifest for te
 
 Some files referenced by the sample manifest are intentionally absent. This allows the manifest validator to demonstrate how it reports missing files.
 
-The `tests/fixtures/` directory provides sample XML view files (`valid_view.xml`, `malformed_view.xml`, `suspicious_view.xml`) and a sample Python model file (`sample_model.py`) for testing and demonstration in MCP Inspector.
+The `tests/fixtures/` directory provides sample XML view files (`valid_view.xml`, `malformed_view.xml`, `suspicious_view.xml`), a sample Python model file (`sample_model.py`), and sample security files (`ir.model.access.csv`, `security_rules.xml`) for testing and demonstration in MCP Inspector.
 
 ## Project Structure
 
@@ -156,8 +170,10 @@ odoo-developer-assistant/
 │       └── __manifest__.py
 └── tests/
     ├── fixtures/
+    │   ├── ir.model.access.csv
     │   ├── malformed_view.xml
     │   ├── sample_model.py
+    │   ├── security_rules.xml
     │   ├── suspicious_view.xml
     │   └── valid_view.xml
     └── test_server.py
@@ -170,6 +186,7 @@ odoo-developer-assistant/
 - Manifest validation does not guarantee that an addon will install successfully in Odoo.
 - XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
 - Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
+- Security analysis is static. It verifies CSV access rule syntax, model ID prefixes, and XML record rule definitions, but does not confirm whether referenced security groups exist in an active Odoo database.
 - The tools do not currently connect to or modify an Odoo database.
 
 ## Future Improvements

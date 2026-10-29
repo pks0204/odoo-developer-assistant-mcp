@@ -4,6 +4,7 @@ from pathlib import Path
 from server import (
     analyze_odoo_error,
     analyze_odoo_python_model,
+    analyze_odoo_security,
     analyze_odoo_xml_view,
     inspect_odoo_module,
     validate_odoo_manifest,
@@ -856,6 +857,224 @@ def test_analyze_python_addon_root_restriction(tmp_path):
 
 def test_analyze_python_non_string_input():
     result = analyze_odoo_python_model(None)
+
+    assert result["success"] is False
+    assert "error" in result
+
+
+# --------------------------------------------------
+# Tests for analyze_odoo_security
+# --------------------------------------------------
+
+def test_analyze_security_valid_csv(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_custom_order_user,custom.order.user,model_custom_order,base.group_user,1,1,1,0\n"
+        "access_custom_order_manager,custom.order.manager,model_custom_order,base.group_system,1,1,1,1\n"
+    )
+    csv_file = tmp_path / "ir.model.access.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert result["file_type"] == "csv"
+    assert result["summary"]["total_rules"] == 2
+    assert result["errors"] == []
+    assert len(result["rules_found"]) == 2
+
+
+def test_analyze_security_csv_missing_header_columns(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write\n"
+        "access_order,order,model_order,base.group_user,1,1\n"
+    )
+    csv_file = tmp_path / "broken_header.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "INVALID_CSV_HEADER" for e in result["errors"])
+
+
+def test_analyze_security_csv_missing_model_prefix(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_custom_order,custom.order,custom_order,base.group_user,1,1,1,0\n"
+    )
+    csv_file = tmp_path / "no_model_prefix.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "MISSING_MODEL_PREFIX" for e in result["errors"])
+
+
+def test_analyze_security_csv_invalid_permission_flag(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_custom_order,custom.order,model_custom_order,base.group_user,1,yes,1,0\n"
+    )
+    csv_file = tmp_path / "invalid_perm.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "INVALID_PERMISSION_FLAG" for e in result["errors"])
+
+
+def test_analyze_security_csv_duplicate_id(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_duplicate,rule1,model_custom_order,base.group_user,1,1,1,0\n"
+        "access_duplicate,rule2,model_custom_order,base.group_system,1,1,1,1\n"
+    )
+    csv_file = tmp_path / "duplicate_id.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "DUPLICATE_ACCESS_ID" for e in result["errors"])
+
+
+def test_analyze_security_csv_row_column_mismatch(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_order,order,model_order,1,1\n"
+    )
+    csv_file = tmp_path / "mismatch.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "ROW_COLUMN_MISMATCH" for e in result["errors"])
+
+
+def test_analyze_security_csv_global_rule_info(tmp_path):
+    csv_content = (
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_global_order,global.order,model_custom_order,,1,0,0,0\n"
+    )
+    csv_file = tmp_path / "global.csv"
+    csv_file.write_text(csv_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(csv_file))
+
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert any(info["code"] == "GLOBAL_ACCESS_NOTICE" for info in result["info"])
+
+
+def test_analyze_security_valid_xml_rule(tmp_path):
+    xml_content = """<odoo>
+    <record id="rule_custom_order_user" model="ir.rule">
+        <field name="name">Custom Order User Rule</field>
+        <field name="model_id" ref="model_custom_order"/>
+        <field name="domain_force">[('create_uid', '=', user.id)]</field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "security_rules.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert result["file_type"] == "xml"
+    assert result["summary"]["total_rules"] == 1
+    assert result["errors"] == []
+
+
+def test_analyze_security_xml_missing_model(tmp_path):
+    xml_content = """<odoo>
+    <record id="rule_no_model" model="ir.rule">
+        <field name="name">No Model Rule</field>
+        <field name="domain_force">[(1, '=', 1)]</field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "no_model_rule.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "MISSING_RULE_MODEL" for e in result["errors"])
+
+
+def test_analyze_security_xml_missing_domain(tmp_path):
+    xml_content = """<odoo>
+    <record id="rule_no_domain" model="ir.rule">
+        <field name="name">No Domain Rule</field>
+        <field name="model_id" ref="model_custom_order"/>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "no_domain_rule.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_security(str(xml_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "MISSING_RULE_DOMAIN" for w in result["warnings"])
+
+
+def test_analyze_security_empty_file(tmp_path):
+    empty_file = tmp_path / "empty_sec.csv"
+    empty_file.write_text("   \n", encoding="utf-8")
+
+    result = analyze_odoo_security(str(empty_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "EMPTY_SECURITY_FILE" for e in result["errors"])
+
+
+def test_analyze_security_missing_file(tmp_path):
+    missing_file = tmp_path / "nonexistent.csv"
+
+    result = analyze_odoo_security(str(missing_file))
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "not exist" in result["error"].lower() or "not found" in result["error"].lower()
+
+
+def test_analyze_security_directory_input(tmp_path):
+    result = analyze_odoo_security(str(tmp_path))
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "directory" in result["error"].lower() or "regular file" in result["error"].lower()
+
+
+def test_analyze_security_addon_root_restriction(tmp_path):
+    addon_dir = tmp_path / "my_addon"
+    addon_dir.mkdir()
+    outside_file = tmp_path / "outside.csv"
+    outside_file.write_text("id,name\n", encoding="utf-8")
+
+    result = analyze_odoo_security(
+        file_path=str(outside_file),
+        addon_path=str(addon_dir),
+    )
+
+    assert result["success"] is False
+    assert "addon" in result["error"].lower()
+
+
+def test_analyze_security_non_string_input():
+    result = analyze_odoo_security(None)
 
     assert result["success"] is False
     assert "error" in result
