@@ -3,6 +3,7 @@ from pathlib import Path
 
 from server import (
     analyze_odoo_error,
+    analyze_odoo_xml_view,
     inspect_odoo_module,
     validate_odoo_manifest,
 )
@@ -388,3 +389,229 @@ def test_analyze_non_string_input():
 
     assert result["success"] is False
     assert "error" in result
+
+
+# --------------------------------------------------
+# Tests for analyze_odoo_xml_view
+# --------------------------------------------------
+
+def test_analyze_xml_valid_view(tmp_path):
+    xml_content = """<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <record id="view_partner_form_custom" model="ir.ui.view">
+        <field name="name">res.partner.form.custom</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <form>
+                <field name="name"/>
+            </form>
+        </field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "partner_view.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert result["summary"]["total_records"] == 1
+    assert result["summary"]["view_records"] == 1
+    assert result["errors"] == []
+
+
+def test_analyze_xml_malformed_syntax(tmp_path):
+    xml_content = """<odoo>
+    <record id="broken_view" model="ir.ui.view">
+        <field name="name">Broken
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "broken_view.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "XML_SYNTAX_ERROR" for e in result["errors"])
+    syntax_error = next(e for e in result["errors"] if e["code"] == "XML_SYNTAX_ERROR")
+    assert syntax_error["line"] is not None
+
+
+def test_analyze_xml_missing_file(tmp_path):
+    missing_file = tmp_path / "nonexistent.xml"
+
+    result = analyze_odoo_xml_view(str(missing_file))
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "not exist" in result["error"].lower() or "not found" in result["error"].lower()
+
+
+def test_analyze_xml_directory_input(tmp_path):
+    result = analyze_odoo_xml_view(str(tmp_path))
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "directory" in result["error"].lower() or "regular file" in result["error"].lower()
+
+
+def test_analyze_xml_empty_file(tmp_path):
+    empty_file = tmp_path / "empty.xml"
+    empty_file.write_text("", encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(empty_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "EMPTY_XML_FILE" for e in result["errors"])
+
+
+def test_analyze_xml_unexpected_root(tmp_path):
+    xml_content = """<custom_root>
+    <record id="test_rec" model="res.partner"/>
+</custom_root>"""
+    xml_file = tmp_path / "custom_root.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "UNEXPECTED_ROOT_TAG" for w in result["warnings"])
+
+
+def test_analyze_xml_duplicate_record_id(tmp_path):
+    xml_content = """<odoo>
+    <record id="duplicate_id" model="res.partner"/>
+    <record id="duplicate_id" model="res.partner"/>
+</odoo>"""
+    xml_file = tmp_path / "duplicate.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "DUPLICATE_RECORD_ID" for e in result["errors"])
+    duplicate_err = next(e for e in result["errors"] if e["code"] == "DUPLICATE_RECORD_ID")
+    assert "duplicate_id" in duplicate_err["message"]
+
+
+def test_analyze_xml_missing_record_attributes(tmp_path):
+    xml_content = """<odoo>
+    <record>
+        <field name="name">No ID or Model</field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "missing_attrs.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    error_codes = [e["code"] for e in result["errors"]]
+    assert "MISSING_RECORD_ID" in error_codes
+    assert "MISSING_RECORD_MODEL" in error_codes
+
+
+def test_analyze_xml_view_missing_arch(tmp_path):
+    xml_content = """<odoo>
+    <record id="view_no_arch" model="ir.ui.view">
+        <field name="name">No Arch View</field>
+        <field name="model">res.partner</field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "no_arch.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "MISSING_ARCH" for w in result["warnings"])
+
+
+def test_analyze_xml_view_empty_arch(tmp_path):
+    xml_content = """<odoo>
+    <record id="view_empty_arch" model="ir.ui.view">
+        <field name="name">Empty Arch View</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+        </field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "empty_arch.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "EMPTY_ARCH" for w in result["warnings"])
+
+
+def test_analyze_xml_external_id_references(tmp_path):
+    xml_content = """<odoo>
+    <record id="view_inherited" model="ir.ui.view">
+        <field name="name">Inherited View</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="base.view_partner_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='name']" position="after">
+                <field name="email"/>
+            </xpath>
+        </field>
+    </record>
+</odoo>"""
+    xml_file = tmp_path / "inherited_view.xml"
+    xml_file.write_text(xml_content, encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert any(
+        info["code"] == "EXTERNAL_ID_REFERENCE" and "base.view_partner_form" in info["ref"]
+        for info in result["info"]
+    )
+
+
+def test_analyze_xml_file_exceeding_size(tmp_path):
+    xml_file = tmp_path / "huge.xml"
+    xml_file.write_text("<odoo>" + " " * 500_001 + "</odoo>", encoding="utf-8")
+
+    result = analyze_odoo_xml_view(str(xml_file))
+
+    assert result["success"] is False
+    assert "too large" in result["error"].lower()
+
+
+def test_analyze_xml_addon_root_restriction(tmp_path):
+    addon_dir = tmp_path / "my_addon"
+    addon_dir.mkdir()
+    outside_xml = tmp_path / "outside.xml"
+    outside_xml.write_text("<odoo/>", encoding="utf-8")
+
+    result = analyze_odoo_xml_view(
+        xml_path=str(outside_xml),
+        addon_path=str(addon_dir),
+    )
+
+    assert result["success"] is False
+    assert "addon" in result["error"].lower()
+
+
+def test_analyze_xml_non_string_input():
+    result = analyze_odoo_xml_view(None)
+
+    assert result["success"] is False
+    assert "error" in result
+
+
+def test_analyze_xml_unicode_decoding_error(tmp_path):
+    bad_file = tmp_path / "bad_encoding.xml"
+    bad_file.write_bytes(b"<odoo>\xff\xfe\x00</odoo>")
+
+    result = analyze_odoo_xml_view(str(bad_file))
+
+    assert result["success"] is False
+    assert "decode" in result["error"].lower() or "read" in result["error"].lower()

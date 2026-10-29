@@ -1,5 +1,9 @@
 import ast
+import io
 from pathlib import Path
+import re
+import xml.sax
+
 from mcp.server import MCPServer
 
 mcp = MCPServer(
@@ -515,6 +519,378 @@ def validate_odoo_manifest(addon_path: str) -> dict:
         "unsafe_paths": unsafe_paths,
         "suggestions": suggestions,
     }
+
+
+MAX_XML_FILE_SIZE = 500_000  # 500 KB
+REF_EVAL_REGEX = re.compile(r"ref\(['\"]([a-zA-Z0-9_\.]+)['\"]\)")
+
+
+class _OdooXMLContentHandler(xml.sax.ContentHandler):
+    """SAX handler to collect Odoo XML records, views, and external references with line numbers."""
+
+    def __init__(self):
+        super().__init__()
+        self.locator = None
+        self.root_tag = None
+        self.records = []
+        self.refs = []
+        self._current_record = None
+        self._current_field = None
+        self._in_arch = False
+        self._arch_children_count = 0
+
+    def setDocumentLocator(self, locator):
+        self.locator = locator
+
+    def startElement(self, name, attrs):
+        line = self.locator.getLineNumber() if self.locator else None
+        if self.root_tag is None:
+            self.root_tag = (name, line)
+
+        # Collect ref attributes
+        if "ref" in attrs:
+            self.refs.append({
+                "ref": attrs["ref"],
+                "line": line,
+                "element": name,
+            })
+
+        # Collect references in eval attributes e.g. ref('...')
+        if "eval" in attrs:
+            eval_val = attrs["eval"]
+            for match in REF_EVAL_REGEX.finditer(eval_val):
+                self.refs.append({
+                    "ref": match.group(1),
+                    "line": line,
+                    "element": name,
+                })
+
+        if name == "record":
+            rec_id = attrs.get("id")
+            rec_model = attrs.get("model")
+            self._current_record = {
+                "id": rec_id,
+                "model": rec_model,
+                "line": line,
+                "has_arch": False,
+                "arch_children": 0,
+            }
+            self.records.append(self._current_record)
+        elif self._current_record:
+            if name == "field":
+                fname = attrs.get("name")
+                self._current_field = fname
+                if fname == "arch":
+                    self._current_record["has_arch"] = True
+                    self._in_arch = True
+                    self._arch_children_count = 0
+            elif self._in_arch:
+                self._arch_children_count += 1
+                self._current_record["arch_children"] = self._arch_children_count
+
+    def endElement(self, name):
+        if name == "record":
+            self._current_record = None
+        elif name == "field" and self._current_field == "arch":
+            self._in_arch = False
+            self._current_field = None
+        elif name == "field":
+            self._current_field = None
+
+
+@mcp.tool()
+def analyze_odoo_xml_view(
+    xml_path: str,
+    addon_path: str | None = None,
+) -> dict:
+    """Analyze an Odoo XML data or view file for structural errors,
+    suspicious references, and common issues.
+
+    Args:
+        xml_path: Absolute or relative path to the XML file.
+        addon_path: Optional path to the containing addon directory to enforce
+            sandboxed file access.
+    """
+    if not isinstance(xml_path, str) or not xml_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide an XML file path as text.",
+        }
+
+    try:
+        resolved_xml = Path(xml_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid XML path: {exc}",
+        }
+
+    if addon_path is not None:
+        if not isinstance(addon_path, str) or not addon_path.strip():
+            return {
+                "success": False,
+                "error": "addon_path must be a non-empty string when provided.",
+            }
+        try:
+            resolved_addon = Path(addon_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Invalid addon path: {exc}",
+            }
+
+        if not resolved_addon.is_dir():
+            return {
+                "success": False,
+                "error": f"Addon directory does not exist: {resolved_addon}",
+            }
+
+        if not resolved_xml.is_relative_to(resolved_addon):
+            return {
+                "success": False,
+                "error": (
+                    "The XML file must reside inside the supplied addon directory."
+                ),
+            }
+
+    if not resolved_xml.exists():
+        return {
+            "success": False,
+            "error": f"XML file does not exist: {resolved_xml}",
+        }
+
+    if not resolved_xml.is_file():
+        return {
+            "success": False,
+            "error": f"Path is a directory or not a regular file: {resolved_xml}",
+        }
+
+    try:
+        file_size = resolved_xml.stat().st_size
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to access XML file: {exc}",
+        }
+
+    if file_size > MAX_XML_FILE_SIZE:
+        return {
+            "success": False,
+            "error": (
+                f"XML file is too large to inspect ({file_size} bytes). "
+                f"Maximum allowed size is {MAX_XML_FILE_SIZE} bytes."
+            ),
+        }
+
+    try:
+        content = resolved_xml.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to decode XML file as UTF-8: {exc}",
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to read XML file: {exc}",
+        }
+
+    if not content.strip():
+        return {
+            "success": True,
+            "valid": False,
+            "file": str(resolved_xml),
+            "summary": {
+                "total_records": 0,
+                "view_records": 0,
+                "error_count": 1,
+                "warning_count": 0,
+                "info_count": 0,
+            },
+            "errors": [
+                {
+                    "code": "EMPTY_XML_FILE",
+                    "message": "The XML file is empty.",
+                    "line": 1,
+                    "element": None,
+                }
+            ],
+            "warnings": [],
+            "info": [],
+            "suggestions": [
+                "Provide valid Odoo XML content with an <odoo> root element."
+            ],
+        }
+
+    handler = _OdooXMLContentHandler()
+    parser = xml.sax.make_parser()
+    parser.setFeature(xml.sax.handler.feature_external_ges, False)
+    parser.setFeature(xml.sax.handler.feature_external_pes, False)
+    parser.setContentHandler(handler)
+
+    try:
+        parser.parse(io.StringIO(content))
+    except xml.sax.SAXParseException as exc:
+        return {
+            "success": True,
+            "valid": False,
+            "file": str(resolved_xml),
+            "summary": {
+                "total_records": 0,
+                "view_records": 0,
+                "error_count": 1,
+                "warning_count": 0,
+                "info_count": 0,
+            },
+            "errors": [
+                {
+                    "code": "XML_SYNTAX_ERROR",
+                    "message": f"XML syntax error: {exc.getMessage()}",
+                    "line": exc.getLineNumber(),
+                    "column": exc.getColumnNumber(),
+                    "element": None,
+                }
+            ],
+            "warnings": [],
+            "info": [],
+            "suggestions": [
+                f"Check XML tag nesting and closing tags around line {exc.getLineNumber()}."
+            ],
+        }
+
+    errors = []
+    warnings = []
+    info = []
+    suggestions = []
+
+    # Check root tag
+    root_tag, root_line = handler.root_tag if handler.root_tag else (None, None)
+    if root_tag not in ("odoo", "openerp"):
+        warnings.append({
+            "code": "UNEXPECTED_ROOT_TAG",
+            "message": (
+                f"Unexpected root tag '<{root_tag}>'. Expected '<odoo>' (or legacy '<openerp>')."
+            ),
+            "line": root_line,
+            "element": root_tag,
+        })
+
+    seen_record_ids = {}
+    total_records = len(handler.records)
+    view_records = 0
+
+    for rec in handler.records:
+        rec_id = rec.get("id")
+        rec_model = rec.get("model")
+        rec_line = rec.get("line")
+
+        if not rec_id or not rec_id.strip():
+            errors.append({
+                "code": "MISSING_RECORD_ID",
+                "message": "<record> element is missing a required 'id' attribute.",
+                "line": rec_line,
+                "element": "record",
+            })
+        else:
+            if rec_id in seen_record_ids:
+                errors.append({
+                    "code": "DUPLICATE_RECORD_ID",
+                    "message": (
+                        f"Duplicate record ID '{rec_id}' found (first declared at line {seen_record_ids[rec_id]})."
+                    ),
+                    "line": rec_line,
+                    "element": "record",
+                })
+            else:
+                seen_record_ids[rec_id] = rec_line
+
+            if " " in rec_id or "\t" in rec_id:
+                warnings.append({
+                    "code": "SUSPICIOUS_ID_FORMAT",
+                    "message": (
+                        f"Record ID '{rec_id}' contains whitespace, which is invalid for an XML ID."
+                    ),
+                    "line": rec_line,
+                    "element": "record",
+                })
+
+        if not rec_model or not rec_model.strip():
+            errors.append({
+                "code": "MISSING_RECORD_MODEL",
+                "message": "<record> element is missing a required 'model' attribute.",
+                "line": rec_line,
+                "element": "record",
+            })
+
+        if rec_model == "ir.ui.view":
+            view_records += 1
+            if not rec.get("has_arch"):
+                warnings.append({
+                    "code": "MISSING_ARCH",
+                    "message": (
+                        f"View record '{rec_id or 'unnamed'}' does not define an 'arch' field."
+                    ),
+                    "line": rec_line,
+                    "element": "record",
+                })
+            elif rec.get("arch_children", 0) == 0:
+                warnings.append({
+                    "code": "EMPTY_ARCH",
+                    "message": (
+                        f"View record '{rec_id or 'unnamed'}' has an empty 'arch' field."
+                    ),
+                    "line": rec_line,
+                    "element": "field",
+                })
+
+    for ref_item in handler.refs:
+        info.append({
+            "code": "EXTERNAL_ID_REFERENCE",
+            "message": (
+                f"External ID reference '{ref_item['ref']}' requires verification in addon dependencies or database."
+            ),
+            "ref": ref_item["ref"],
+            "line": ref_item["line"],
+            "element": ref_item["element"],
+        })
+
+    valid = len(errors) == 0
+
+    if errors:
+        suggestions.append(
+            "Resolve the identified XML errors to ensure valid record definitions."
+        )
+    if warnings:
+        suggestions.append(
+            "Review warnings to verify view architecture and root element structure."
+        )
+    if info:
+        suggestions.append(
+            "Verify that referenced external IDs exist in depends modules."
+        )
+    if valid and not warnings:
+        suggestions.append(
+            "The XML file passed static structural checks. "
+            "Semantic validation requires an active Odoo instance."
+        )
+
+    return {
+        "success": True,
+        "valid": valid,
+        "file": str(resolved_xml),
+        "summary": {
+            "total_records": total_records,
+            "view_records": view_records,
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "info_count": len(info),
+        },
+        "errors": errors,
+        "warnings": warnings,
+        "info": info,
+        "suggestions": suggestions,
+    }
+
 
 if __name__ == "__main__":
     mcp.run()
