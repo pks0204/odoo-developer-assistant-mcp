@@ -31,3 +31,8 @@ Thumbs.db
 # Local development backups
 server_backup.py
 server_backup_before_manifest_validation.py
+
+# Python packaging & build artifacts
+*.egg-info/
+dist/
+build/

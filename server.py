@@ -1983,6 +1983,9 @@ def check_odoo_addon_health(
         "suggestions": suggestions,
     }
 
+def main() -> None:
+    mcp.run()
+
 
 if __name__ == "__main__":
-    mcp.run()
+    main()

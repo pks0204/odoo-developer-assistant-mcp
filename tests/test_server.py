@@ -1,5 +1,6 @@
 import ast
 from pathlib import Path
+from unittest.mock import patch
 
 from server import (
     analyze_odoo_error,
@@ -8,6 +9,7 @@ from server import (
     analyze_odoo_xml_view,
     check_odoo_addon_health,
     inspect_odoo_module,
+    main,
     validate_odoo_manifest,
 )
 
@@ -1359,3 +1361,9 @@ def test_addon_health_aggregated_suggestions(tmp_path):
     assert result["success"] is True
     assert isinstance(result["suggestions"], list)
     assert len(result["suggestions"]) > 0
+
+
+def test_main_entry_point_calls_mcp_run():
+    with patch("server.mcp.run") as mock_run:
+        main()
+        mock_run.assert_called_once()

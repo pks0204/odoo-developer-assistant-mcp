@@ -141,7 +141,62 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 84 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, unified health check, and edge cases.
+The current test suite contains 85 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, unified health check, entry points, and edge cases.
+
+## Client Configuration
+
+You can connect this MCP server to any MCP-compliant client (Claude Desktop, Cursor, Zed, etc.).
+
+### Claude Desktop
+
+Add the following to your Claude Desktop configuration file:
+- **macOS**: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Linux**: `~/.config/Claude/claude_desktop_config.json`
+- **Windows**: `%APPDATA%\Claude\claude_desktop_config.json`
+
+#### Option A: Direct execution with `uvx` (No local clone needed)
+
+```json
+{
+  "mcpServers": {
+    "odoo-developer-assistant": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/pks0204/odoo-developer-assistant-mcp",
+        "odoo-developer-assistant"
+      ]
+    }
+  }
+}
+```
+
+#### Option B: Local Repository
+
+```json
+{
+  "mcpServers": {
+    "odoo-developer-assistant": {
+      "command": "/absolute/path/to/odoo-developer-assistant/.venv/bin/odoo-developer-assistant"
+    }
+  }
+}
+```
+
+### Cursor / Zed
+
+Configure the command in your editor's MCP settings:
+- **Command**: `odoo-developer-assistant` (if installed in PATH or via `uvx`)
+- **Transport**: `stdio`
+
+### Example Assistant Prompts
+
+Once configured, you can prompt your AI assistant with queries like:
+- *"Audit the health of my custom addon at `/path/to/my_module` before I install it."*
+- *"Check this Odoo log traceback and explain the root cause: `<paste traceback>`"*
+- *"Inspect the XML view at `views/sale_order_views.xml` for structural errors or deprecated syntax."*
+- *"Analyze `models/res_partner.py` for missing inverse fields or incomplete @api decorators."*
+- *"Verify my `security/ir.model.access.csv` permissions file."*
 
 ## Run with MCP Inspector
 
@@ -173,7 +228,9 @@ odoo-developer-assistant/
 │   └── workflows/
 │       └── ci.yml
 ├── .gitignore
+├── LICENSE
 ├── README.md
+├── pyproject.toml
 ├── pytest.ini
 ├── requirements.txt
 ├── run_inspector.sh
@@ -206,10 +263,10 @@ odoo-developer-assistant/
 ## Future Improvements
 
 - Recognize additional Odoo error patterns.
+- Cross-file consistency analysis (e.g. checking XML view field references against declared model fields).
 - Expand automated tests for unusual and invalid inputs.
-- Improve manifest validation and dependency diagnostics.
-- Add more detailed examples and usage documentation.
+- Add optional live Odoo XML-RPC metadata introspection.
 
 ## License
 
-No project license has been specified yet. Add a license before distributing the project for reuse.
+This project is licensed under the GNU Lesser General Public License v3.0 (LGPL-3.0) — see the [LICENSE](LICENSE) file for details.
