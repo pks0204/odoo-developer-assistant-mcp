@@ -3,6 +3,7 @@ from pathlib import Path
 
 from server import (
     analyze_odoo_error,
+    analyze_odoo_python_model,
     analyze_odoo_xml_view,
     inspect_odoo_module,
     validate_odoo_manifest,
@@ -615,3 +616,246 @@ def test_analyze_xml_unicode_decoding_error(tmp_path):
 
     assert result["success"] is False
     assert "decode" in result["error"].lower() or "read" in result["error"].lower()
+
+
+# --------------------------------------------------
+# Tests for analyze_odoo_python_model
+# --------------------------------------------------
+
+def test_analyze_python_valid_model(tmp_path):
+    py_content = """# -*- coding: utf-8 -*-
+from odoo import models, fields, api
+
+class CustomOrder(models.Model):
+    _name = 'custom.order'
+    _description = 'Custom Sales Order'
+
+    name = fields.Char(string='Order Reference', required=True)
+    partner_id = fields.Many2one('res.partner', string='Customer', ondelete='restrict')
+    line_ids = fields.One2many('custom.order.line', 'order_id', string='Order Lines')
+
+    @api.depends('name')
+    def _compute_display_name(self):
+        for record in self:
+            record.display_name = record.name
+"""
+    py_file = tmp_path / "custom_order.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert result["summary"]["model_classes"] == 1
+    assert result["summary"]["total_fields"] == 3
+    assert result["errors"] == []
+    assert result["models_found"][0]["name"] == "custom.order"
+    assert result["models_found"][0]["description"] == "Custom Sales Order"
+
+
+def test_analyze_python_syntax_error(tmp_path):
+    py_content = """class BrokenModel(models.Model:
+    pass
+"""
+    py_file = tmp_path / "broken.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "PYTHON_SYNTAX_ERROR" for e in result["errors"])
+    syntax_err = next(e for e in result["errors"] if e["code"] == "PYTHON_SYNTAX_ERROR")
+    assert syntax_err["line"] is not None
+
+
+def test_analyze_python_missing_file(tmp_path):
+    missing_file = tmp_path / "missing_model.py"
+
+    result = analyze_odoo_python_model(str(missing_file))
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "not exist" in result["error"].lower() or "not found" in result["error"].lower()
+
+
+def test_analyze_python_directory_input(tmp_path):
+    result = analyze_odoo_python_model(str(tmp_path))
+
+    assert result["success"] is False
+    assert "error" in result
+    assert "directory" in result["error"].lower() or "regular file" in result["error"].lower()
+
+
+def test_analyze_python_empty_file(tmp_path):
+    empty_file = tmp_path / "empty.py"
+    empty_file.write_text("   \n", encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(empty_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "EMPTY_PYTHON_FILE" for e in result["errors"])
+
+
+def test_analyze_python_missing_description(tmp_path):
+    py_content = """from odoo import models, fields
+
+class NewModel(models.Model):
+    _name = 'new.model'
+
+    name = fields.Char(string='Name')
+"""
+    py_file = tmp_path / "no_desc.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "MISSING_MODEL_DESCRIPTION" for w in result["warnings"])
+
+
+def test_analyze_python_missing_model_name(tmp_path):
+    py_content = """from odoo import models
+
+class NamelessModel(models.Model):
+    pass
+"""
+    py_file = tmp_path / "nameless.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "MISSING_MODEL_NAME" for w in result["warnings"])
+
+
+def test_analyze_python_many2one_missing_comodel(tmp_path):
+    py_content = """from odoo import models, fields
+
+class TestModel(models.Model):
+    _name = 'test.model'
+    _description = 'Test'
+
+    partner_id = fields.Many2one(string='Partner')
+"""
+    py_file = tmp_path / "missing_comodel.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "MISSING_COMODEL_NAME" for e in result["errors"])
+
+
+def test_analyze_python_one2many_missing_inverse(tmp_path):
+    py_content = """from odoo import models, fields
+
+class TestModel(models.Model):
+    _name = 'test.model'
+    _description = 'Test'
+
+    line_ids = fields.One2many('test.line', string='Lines')
+"""
+    py_file = tmp_path / "missing_inverse.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "MISSING_INVERSE_NAME" for e in result["errors"])
+
+
+def test_analyze_python_invalid_ondelete(tmp_path):
+    py_content = """from odoo import models, fields
+
+class TestModel(models.Model):
+    _name = 'test.model'
+    _description = 'Test'
+
+    partner_id = fields.Many2one('res.partner', ondelete='remove_all')
+"""
+    py_file = tmp_path / "invalid_ondelete.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "INVALID_ONDELETE" for w in result["warnings"])
+
+
+def test_analyze_python_empty_api_depends(tmp_path):
+    py_content = """from odoo import models, fields, api
+
+class TestModel(models.Model):
+    _name = 'test.model'
+    _description = 'Test'
+
+    total = fields.Float(compute='_compute_total')
+
+    @api.depends()
+    def _compute_total(self):
+        pass
+"""
+    py_file = tmp_path / "empty_depends.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert any(e["code"] == "EMPTY_DEPENDS_ARGS" for e in result["errors"])
+
+
+def test_analyze_python_empty_api_onchange(tmp_path):
+    py_content = """from odoo import models, fields, api
+
+class TestModel(models.Model):
+    _name = 'test.model'
+    _description = 'Test'
+
+    @api.onchange()
+    def _onchange_something(self):
+        pass
+"""
+    py_file = tmp_path / "empty_onchange.py"
+    py_file.write_text(py_content, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is True
+    assert any(w["code"] == "EMPTY_ONCHANGE_ARGS" for w in result["warnings"])
+
+
+def test_analyze_python_file_exceeding_size(tmp_path):
+    py_file = tmp_path / "huge.py"
+    py_file.write_text("# comment\n" + "x = 1\n" * 100_000, encoding="utf-8")
+
+    result = analyze_odoo_python_model(str(py_file))
+
+    assert result["success"] is False
+    assert "too large" in result["error"].lower()
+
+
+def test_analyze_python_addon_root_restriction(tmp_path):
+    addon_dir = tmp_path / "my_addon"
+    addon_dir.mkdir()
+    outside_py = tmp_path / "outside.py"
+    outside_py.write_text("x = 1", encoding="utf-8")
+
+    result = analyze_odoo_python_model(
+        python_path=str(outside_py),
+        addon_path=str(addon_dir),
+    )
+
+    assert result["success"] is False
+    assert "addon" in result["error"].lower()
+
+
+def test_analyze_python_non_string_input():
+    result = analyze_odoo_python_model(None)
+
+    assert result["success"] is False
+    assert "error" in result

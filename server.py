@@ -892,5 +892,443 @@ def analyze_odoo_xml_view(
     }
 
 
+MAX_PYTHON_FILE_SIZE = 500_000  # 500 KB
+
+
+def _is_odoo_model_class(node: ast.ClassDef) -> bool:
+    """Check if an AST ClassDef represents an Odoo model."""
+    for base in node.bases:
+        if isinstance(base, ast.Attribute):
+            if isinstance(base.value, ast.Name) and base.value.id == "models":
+                if base.attr in ("Model", "TransientModel", "AbstractModel"):
+                    return True
+        elif isinstance(base, ast.Name):
+            if base.id in ("Model", "TransientModel", "AbstractModel"):
+                return True
+    for stmt in node.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id in ("_name", "_inherit"):
+                    return True
+    return False
+
+
+@mcp.tool()
+def analyze_odoo_python_model(
+    python_path: str,
+    addon_path: str | None = None,
+) -> dict:
+    """Analyze an Odoo Python model file for structural errors, missing attributes,
+    decorator misconfigurations, and common mistakes using AST.
+
+    Args:
+        python_path: Absolute or relative path to the Python file.
+        addon_path: Optional path to the containing addon directory to enforce
+            sandboxed file access.
+    """
+    if not isinstance(python_path, str) or not python_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide a Python file path as text.",
+        }
+
+    try:
+        resolved_python = Path(python_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid Python path: {exc}",
+        }
+
+    if addon_path is not None:
+        if not isinstance(addon_path, str) or not addon_path.strip():
+            return {
+                "success": False,
+                "error": "addon_path must be a non-empty string when provided.",
+            }
+        try:
+            resolved_addon = Path(addon_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Invalid addon path: {exc}",
+            }
+
+        if not resolved_addon.is_dir():
+            return {
+                "success": False,
+                "error": f"Addon directory does not exist: {resolved_addon}",
+            }
+
+        if not resolved_python.is_relative_to(resolved_addon):
+            return {
+                "success": False,
+                "error": (
+                    "The Python file must reside inside the supplied addon directory."
+                ),
+            }
+
+    if not resolved_python.exists():
+        return {
+            "success": False,
+            "error": f"Python file does not exist: {resolved_python}",
+        }
+
+    if not resolved_python.is_file():
+        return {
+            "success": False,
+            "error": f"Path is a directory or not a regular file: {resolved_python}",
+        }
+
+    try:
+        file_size = resolved_python.stat().st_size
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to access Python file: {exc}",
+        }
+
+    if file_size > MAX_PYTHON_FILE_SIZE:
+        return {
+            "success": False,
+            "error": (
+                f"Python file is too large to inspect ({file_size} bytes). "
+                f"Maximum allowed size is {MAX_PYTHON_FILE_SIZE} bytes."
+            ),
+        }
+
+    try:
+        content = resolved_python.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to decode Python file as UTF-8: {exc}",
+        }
+    except OSError as exc:
+        return {
+            "success": False,
+            "error": f"Unable to read Python file: {exc}",
+        }
+
+    if not content.strip():
+        return {
+            "success": True,
+            "valid": False,
+            "file": str(resolved_python),
+            "summary": {
+                "total_classes": 0,
+                "model_classes": 0,
+                "total_fields": 0,
+                "error_count": 1,
+                "warning_count": 0,
+                "info_count": 0,
+            },
+            "models_found": [],
+            "errors": [
+                {
+                    "code": "EMPTY_PYTHON_FILE",
+                    "message": "The Python file is empty.",
+                    "line": 1,
+                    "element": None,
+                }
+            ],
+            "warnings": [],
+            "info": [],
+            "suggestions": [
+                "Provide Python code with Odoo model definitions."
+            ],
+        }
+
+    try:
+        tree = ast.parse(content, filename=str(resolved_python))
+    except SyntaxError as exc:
+        return {
+            "success": True,
+            "valid": False,
+            "file": str(resolved_python),
+            "summary": {
+                "total_classes": 0,
+                "model_classes": 0,
+                "total_fields": 0,
+                "error_count": 1,
+                "warning_count": 0,
+                "info_count": 0,
+            },
+            "models_found": [],
+            "errors": [
+                {
+                    "code": "PYTHON_SYNTAX_ERROR",
+                    "message": f"Python syntax error: {exc.msg}",
+                    "line": exc.lineno,
+                    "column": exc.offset,
+                    "element": None,
+                }
+            ],
+            "warnings": [],
+            "info": [],
+            "suggestions": [
+                f"Check Python syntax around line {exc.lineno}: {exc.text or ''}".strip()
+            ],
+        }
+
+    errors = []
+    warnings = []
+    info = []
+    suggestions = []
+    models_found = []
+
+    total_classes = 0
+    total_fields = 0
+
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        total_classes += 1
+        if not _is_odoo_model_class(node):
+            continue
+
+        model_name = None
+        model_inherit = None
+        model_description = None
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        if target.id == "_name":
+                            if isinstance(stmt.value, ast.Constant) and isinstance(
+                                stmt.value.value, str
+                            ):
+                                model_name = stmt.value.value
+                        elif target.id == "_inherit":
+                            if isinstance(stmt.value, ast.Constant) and isinstance(
+                                stmt.value.value, str
+                            ):
+                                model_inherit = stmt.value.value
+                            elif isinstance(stmt.value, (ast.List, ast.Tuple)):
+                                model_inherit = [
+                                    elt.value
+                                    for elt in stmt.value.elts
+                                    if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+                                ]
+                        elif target.id == "_description":
+                            if isinstance(stmt.value, ast.Constant) and isinstance(
+                                stmt.value.value, str
+                            ):
+                                model_description = stmt.value.value
+
+                # Inspect field assignments
+                if isinstance(stmt.value, ast.Call):
+                    func = stmt.value.func
+                    is_field = False
+                    field_type = None
+
+                    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+                        if func.value.id == "fields":
+                            is_field = True
+                            field_type = func.attr
+                    elif isinstance(func, ast.Name):
+                        if func.id in (
+                            "Char",
+                            "Integer",
+                            "Float",
+                            "Boolean",
+                            "Text",
+                            "Html",
+                            "Date",
+                            "Datetime",
+                            "Binary",
+                            "Selection",
+                            "Many2one",
+                            "One2many",
+                            "Many2many",
+                            "Many2oneReference",
+                        ):
+                            is_field = True
+                            field_type = func.id
+
+                    if is_field:
+                        total_fields += 1
+                        field_name = (
+                            stmt.targets[0].id
+                            if stmt.targets and isinstance(stmt.targets[0], ast.Name)
+                            else "unknown"
+                        )
+                        args = stmt.value.args
+                        keywords = {kw.arg: kw.value for kw in stmt.value.keywords if kw.arg}
+
+                        # Relational field validations
+                        if field_type == "Many2one":
+                            has_comodel = len(args) >= 1 or "comodel_name" in keywords
+                            if not has_comodel:
+                                errors.append({
+                                    "code": "MISSING_COMODEL_NAME",
+                                    "message": (
+                                        f"Field '{field_name}' (Many2one) is missing a required comodel_name."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": field_name,
+                                })
+                            if "ondelete" in keywords:
+                                ondelete_node = keywords["ondelete"]
+                                if isinstance(ondelete_node, ast.Constant) and isinstance(
+                                    ondelete_node.value, str
+                                ):
+                                    val = ondelete_node.value.lower()
+                                    if val not in {
+                                        "set null",
+                                        "restrict",
+                                        "cascade",
+                                        "set default",
+                                    }:
+                                        warnings.append({
+                                            "code": "INVALID_ONDELETE",
+                                            "message": (
+                                                f"Field '{field_name}' specifies suspicious ondelete='{val}'. "
+                                                "Standard options are 'set null', 'restrict', 'cascade', 'set default'."
+                                            ),
+                                            "line": stmt.lineno,
+                                            "element": field_name,
+                                        })
+
+                        elif field_type == "One2many":
+                            has_comodel = len(args) >= 1 or "comodel_name" in keywords
+                            has_inverse = len(args) >= 2 or "inverse_name" in keywords
+                            if not has_comodel:
+                                errors.append({
+                                    "code": "MISSING_COMODEL_NAME",
+                                    "message": (
+                                        f"Field '{field_name}' (One2many) is missing a required comodel_name."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": field_name,
+                                })
+                            if not has_inverse:
+                                errors.append({
+                                    "code": "MISSING_INVERSE_NAME",
+                                    "message": (
+                                        f"Field '{field_name}' (One2many) is missing a required inverse_name "
+                                        "(the Many2one field name on the comodel)."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": field_name,
+                                })
+
+                        elif field_type == "Many2many":
+                            has_comodel = len(args) >= 1 or "comodel_name" in keywords
+                            if not has_comodel:
+                                errors.append({
+                                    "code": "MISSING_COMODEL_NAME",
+                                    "message": (
+                                        f"Field '{field_name}' (Many2many) is missing a required comodel_name."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": field_name,
+                                })
+
+            # Inspect method decorators
+            elif isinstance(stmt, ast.FunctionDef):
+                for dec in stmt.decorator_list:
+                    if isinstance(dec, ast.Call):
+                        dec_func = dec.func
+                        if (
+                            isinstance(dec_func, ast.Attribute)
+                            and isinstance(dec_func.value, ast.Name)
+                            and dec_func.value.id == "api"
+                        ):
+                            dec_name = dec_func.attr
+                            if dec_name == "depends" and len(dec.args) == 0:
+                                errors.append({
+                                    "code": "EMPTY_DEPENDS_ARGS",
+                                    "message": (
+                                        f"@api.depends() on method '{stmt.name}' has no dependency arguments."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": stmt.name,
+                                })
+                            elif dec_name == "onchange" and len(dec.args) == 0:
+                                warnings.append({
+                                    "code": "EMPTY_ONCHANGE_ARGS",
+                                    "message": (
+                                        f"@api.onchange() on method '{stmt.name}' has no field arguments."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": stmt.name,
+                                })
+                            elif dec_name == "constrains" and len(dec.args) == 0:
+                                warnings.append({
+                                    "code": "EMPTY_CONSTRAINS_ARGS",
+                                    "message": (
+                                        f"@api.constrains() on method '{stmt.name}' has no field arguments."
+                                    ),
+                                    "line": stmt.lineno,
+                                    "element": stmt.name,
+                                })
+
+        # Class-level model validations
+        if not model_name and not model_inherit:
+            warnings.append({
+                "code": "MISSING_MODEL_NAME",
+                "message": (
+                    f"Class '{node.name}' inherits from an Odoo model but defines neither '_name' nor '_inherit'."
+                ),
+                "line": node.lineno,
+                "element": node.name,
+            })
+
+        if model_name and not model_inherit and not model_description:
+            warnings.append({
+                "code": "MISSING_MODEL_DESCRIPTION",
+                "message": (
+                    f"Model '{model_name}' (class '{node.name}') defines a new model without a '_description' attribute."
+                ),
+                "line": node.lineno,
+                "element": node.name,
+            })
+
+        models_found.append({
+            "class_name": node.name,
+            "name": model_name,
+            "inherit": model_inherit,
+            "description": model_description,
+            "line": node.lineno,
+        })
+
+    valid = len(errors) == 0
+
+    if errors:
+        suggestions.append(
+            "Resolve Python syntax or model field/decorator errors before running the addon."
+        )
+    if warnings:
+        suggestions.append(
+            "Review model warnings to ensure proper documentation, naming, and decorator configuration."
+        )
+    if valid and not warnings:
+        suggestions.append(
+            "The Python model file passed static AST checks. Runtime Odoo behavior requires testing with an active Odoo instance."
+        )
+
+    return {
+        "success": True,
+        "valid": valid,
+        "file": str(resolved_python),
+        "summary": {
+            "total_classes": total_classes,
+            "model_classes": len(models_found),
+            "total_fields": total_fields,
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "info_count": len(info),
+        },
+        "models_found": models_found,
+        "errors": errors,
+        "warnings": warnings,
+        "info": info,
+        "suggestions": suggestions,
+    }
+
+
 if __name__ == "__main__":
     mcp.run()

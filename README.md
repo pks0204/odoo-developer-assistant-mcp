@@ -62,6 +62,20 @@ Capabilities include:
 - **External ID Reference Extraction**: Extracts `ref` attributes and `ref('...')` expressions as informational items requiring verification in manifest dependencies or database models.
 - **File Safety**: Enforces a 500 KB maximum file size limit, handles encoding issues, rejects directories, and supports optional `addon_path` confinement to prevent path traversal or symlink escapes.
 
+### 5. Odoo Python Model Analyzer
+
+The `analyze_odoo_python_model` tool statically analyzes Python model files using Python's standard `ast` module to detect structural errors, missing attributes, decorator misconfigurations, and common mistakes without executing untrusted code.
+
+Capabilities include:
+
+- **Model Class Inspection**: Detects classes inheriting from `models.Model`, `models.TransientModel`, or `models.AbstractModel`.
+- **Model Attribute Validation**: Checks for `_name`, `_inherit`, and flags new models missing a `_description` attribute.
+- **Relational Field Checks**: Flags `fields.Many2one` or `fields.Many2many` missing comodel names, and `fields.One2many` missing inverse field names.
+- **On-delete Validation**: Warns about suspicious `ondelete` configurations on `Many2one` fields.
+- **Decorator Diagnostics**: Flags `@api.depends()`, `@api.onchange()`, or `@api.constrains()` decorators with empty arguments.
+- **File Safety**: Enforces a 500 KB maximum file size limit, handles encoding gracefully, and supports optional `addon_path` sandboxing.
+
+
 
 ## Requirements
 
@@ -100,7 +114,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 39 tests covering error classification, addon inspection, manifest validation, XML view analysis, and edge cases.
+The current test suite contains 54 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, and edge cases.
 
 ## Run with MCP Inspector
 
@@ -122,7 +136,7 @@ The `sample_addons/my_custom_module` directory contains a sample manifest for te
 
 Some files referenced by the sample manifest are intentionally absent. This allows the manifest validator to demonstrate how it reports missing files.
 
-The `tests/fixtures/` directory provides sample XML view files (`valid_view.xml`, `malformed_view.xml`, `suspicious_view.xml`) for testing and demonstration in MCP Inspector.
+The `tests/fixtures/` directory provides sample XML view files (`valid_view.xml`, `malformed_view.xml`, `suspicious_view.xml`) and a sample Python model file (`sample_model.py`) for testing and demonstration in MCP Inspector.
 
 ## Project Structure
 
@@ -143,6 +157,7 @@ odoo-developer-assistant/
 └── tests/
     ├── fixtures/
     │   ├── malformed_view.xml
+    │   ├── sample_model.py
     │   ├── suspicious_view.xml
     │   └── valid_view.xml
     └── test_server.py
@@ -154,6 +169,7 @@ odoo-developer-assistant/
 - Dependency inspection only checks the supplied addon directories.
 - Manifest validation does not guarantee that an addon will install successfully in Odoo.
 - XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
+- Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
 - The tools do not currently connect to or modify an Odoo database.
 
 ## Future Improvements
