@@ -572,9 +572,11 @@ class _OdooXMLContentHandler(xml.sax.ContentHandler):
             self._current_record = {
                 "id": rec_id,
                 "model": rec_model,
+                "target_model": None,
                 "line": line,
                 "has_arch": False,
                 "arch_children": 0,
+                "arch_fields": [],
             }
             self.records.append(self._current_record)
         elif self._current_record:
@@ -585,12 +587,32 @@ class _OdooXMLContentHandler(xml.sax.ContentHandler):
                     self._current_record["has_arch"] = True
                     self._in_arch = True
                     self._arch_children_count = 0
+                elif self._in_arch:
+                    self._arch_children_count += 1
+                    self._current_record["arch_children"] = self._arch_children_count
+                    if fname and fname not in self._current_record["arch_fields"]:
+                        self._current_record["arch_fields"].append(fname)
             elif self._in_arch:
                 self._arch_children_count += 1
                 self._current_record["arch_children"] = self._arch_children_count
 
+    def characters(self, content):
+        if (
+            self._current_record
+            and not self._in_arch
+            and self._current_field == "model"
+        ):
+            if self._current_record.get("target_model") is None:
+                self._current_record["target_model"] = ""
+            self._current_record["target_model"] += content
+
     def endElement(self, name):
         if name == "record":
+            if (
+                self._current_record
+                and isinstance(self._current_record.get("target_model"), str)
+            ):
+                self._current_record["target_model"] = self._current_record["target_model"].strip()
             self._current_record = None
         elif name == "field" and self._current_field == "arch":
             self._in_arch = False
@@ -886,6 +908,16 @@ def analyze_odoo_xml_view(
             "warning_count": len(warnings),
             "info_count": len(info),
         },
+        "views_found": [
+            {
+                "id": r.get("id"),
+                "target_model": r.get("target_model"),
+                "line": r.get("line"),
+                "arch_fields": r.get("arch_fields", []),
+            }
+            for r in handler.records
+            if r.get("model") == "ir.ui.view"
+        ],
         "errors": errors,
         "warnings": warnings,
         "info": info,
@@ -1092,6 +1124,7 @@ def analyze_odoo_python_model(
         model_name = None
         model_inherit = None
         model_description = None
+        class_fields = []
 
         for stmt in node.body:
             if isinstance(stmt, ast.Assign):
@@ -1156,6 +1189,11 @@ def analyze_odoo_python_model(
                             if stmt.targets and isinstance(stmt.targets[0], ast.Name)
                             else "unknown"
                         )
+                        class_fields.append({
+                            "name": field_name,
+                            "type": field_type,
+                            "line": stmt.lineno,
+                        })
                         args = stmt.value.args
                         keywords = {kw.arg: kw.value for kw in stmt.value.keywords if kw.arg}
 
@@ -1293,6 +1331,8 @@ def analyze_odoo_python_model(
             "name": model_name,
             "inherit": model_inherit,
             "description": model_description,
+            "fields": [f["name"] for f in class_fields],
+            "field_definitions": class_fields,
             "line": node.lineno,
         })
 
@@ -1740,6 +1780,18 @@ def analyze_odoo_security(
     }
 
 
+ODOO_BASE_FIELDS = {
+    "id",
+    "display_name",
+    "create_uid",
+    "create_date",
+    "write_uid",
+    "write_date",
+    "active",
+    "__last_update",
+}
+
+
 @mcp.tool()
 def check_odoo_addon_health(
     addon_path: str,
@@ -1845,6 +1897,7 @@ def check_odoo_addon_health(
                     xml_files_to_check.add(xml_file.resolve())
 
     views_audit = []
+    all_views = []
     for xml_path in sorted(xml_files_to_check):
         rel_path = (
             str(xml_path.relative_to(resolved_addon))
@@ -1861,9 +1914,18 @@ def check_odoo_addon_health(
             "warnings": xml_analysis.get("warnings", []),
             "info": xml_analysis.get("info", []),
         })
+        for v in xml_analysis.get("views_found", []):
+            all_views.append({
+                "file": rel_path,
+                "view_id": v.get("id"),
+                "target_model": v.get("target_model"),
+                "line": v.get("line"),
+                "arch_fields": v.get("arch_fields", []),
+            })
 
     # 4. Python Models Audit
     models_audit = []
+    all_models = []
     models_dir = resolved_addon / "models"
     if models_dir.is_dir():
         for py_file in sorted(models_dir.glob("**/*.py")):
@@ -1873,16 +1935,26 @@ def check_odoo_addon_health(
             py_analysis = analyze_odoo_python_model(
                 python_path=str(py_file), addon_path=str(resolved_addon)
             )
+            models_found_in_file = py_analysis.get("models_found", [])
             models_audit.append({
                 "file": rel_path,
                 "valid": py_analysis.get("valid", False),
-                "models_found": len(py_analysis.get("models_found", [])),
+                "models_found": len(models_found_in_file),
                 "errors": py_analysis.get("errors", []),
                 "warnings": py_analysis.get("warnings", []),
             })
+            for m in models_found_in_file:
+                all_models.append({
+                    "file": rel_path,
+                    "class_name": m.get("class_name"),
+                    "name": m.get("name"),
+                    "inherit": m.get("inherit"),
+                    "fields": m.get("fields", []),
+                })
 
     # 5. Security Audit
     security_audit = []
+    all_rules = []
     security_dir = resolved_addon / "security"
     if security_dir.is_dir():
         for sec_file in sorted(security_dir.iterdir()):
@@ -1905,6 +1977,73 @@ def check_odoo_addon_health(
                     "errors": sec_analysis.get("errors", []),
                     "warnings": sec_analysis.get("warnings", []),
                 })
+                all_rules.extend(sec_analysis.get("rules_found", []))
+
+    # 6. Cross-File Consistency Audit
+    addon_models_by_name = {}
+    for mod in all_models:
+        m_name = mod.get("name")
+        if m_name:
+            if m_name not in addon_models_by_name:
+                addon_models_by_name[m_name] = {
+                    "file": mod.get("file"),
+                    "class_name": mod.get("class_name"),
+                    "inherit": mod.get("inherit"),
+                    "fields": set(mod.get("fields", [])),
+                }
+            else:
+                addon_models_by_name[m_name]["fields"].update(mod.get("fields", []))
+
+    secured_model_names = set()
+    for rule in all_rules:
+        r_model = rule.get("model")
+        if r_model and isinstance(r_model, str):
+            clean_model = r_model.split(".")[-1]
+            if clean_model.startswith("model_"):
+                clean_model = clean_model[6:]
+            secured_model_names.add(clean_model.lower())
+
+    cross_file_issues = []
+
+    # Check A: Custom models have security access rules
+    for m_name, m_info in addon_models_by_name.items():
+        inherit = m_info.get("inherit")
+        is_new_model = not inherit or (isinstance(inherit, str) and inherit != m_name)
+        if is_new_model:
+            normalized_name = m_name.replace(".", "_").lower()
+            if normalized_name not in secured_model_names:
+                cross_file_issues.append({
+                    "code": "MISSING_MODEL_ACCESS_RULE",
+                    "severity": "warning",
+                    "message": (
+                        f"Model '{m_name}' defined in '{m_info['file']}' has no access rules defined in security CSV files. "
+                        "In Odoo 14+, models without access rules are inaccessible to users."
+                    ),
+                    "element": m_name,
+                    "file": m_info["file"],
+                })
+
+    # Check B: View fields exist on target models defined in addon
+    for view in all_views:
+        target_model = view.get("target_model")
+        if target_model and target_model in addon_models_by_name:
+            m_info = addon_models_by_name[target_model]
+            valid_fields = m_info["fields"] | ODOO_BASE_FIELDS
+            for field_name in view.get("arch_fields", []):
+                if field_name not in valid_fields:
+                    cross_file_issues.append({
+                        "code": "UNDECLARED_VIEW_FIELD",
+                        "severity": "warning",
+                        "message": (
+                            f"View '{view.get('view_id') or 'unnamed'}' in '{view['file']}' references field '{field_name}' "
+                            f"on model '{target_model}', but it is not declared in addon model definitions."
+                        ),
+                        "element": field_name,
+                        "file": view["file"],
+                    })
+
+    cross_file_errors = [i for i in cross_file_issues if i.get("severity") == "error"]
+    cross_file_warnings = [i for i in cross_file_issues if i.get("severity") == "warning"]
 
     # Aggregates
     manifest_valid = manifest_res.get("valid", True)
@@ -1926,9 +2065,13 @@ def check_odoo_addon_health(
         + views_errors_count
         + models_errors_count
         + sec_errors_count
+        + len(cross_file_errors)
     )
     total_warnings = (
-        views_warnings_count + models_warnings_count + sec_warnings_count
+        views_warnings_count
+        + models_warnings_count
+        + sec_warnings_count
+        + len(cross_file_warnings)
     )
 
     files_scanned = (
@@ -1951,6 +2094,14 @@ def check_odoo_addon_health(
         suggestions.append(f"Fix {models_errors_count} error(s) in Python models.")
     if sec_errors_count > 0:
         suggestions.append(f"Fix {sec_errors_count} error(s) in security files.")
+    if any(i["code"] == "MISSING_MODEL_ACCESS_RULE" for i in cross_file_issues):
+        suggestions.append(
+            "Define access rules in security/ir.model.access.csv for all custom models."
+        )
+    if any(i["code"] == "UNDECLARED_VIEW_FIELD" for i in cross_file_issues):
+        suggestions.append(
+            "Verify view field references against declared Python model fields."
+        )
     if total_warnings > 0:
         suggestions.append(f"Review {total_warnings} warning(s) across the addon.")
     if health_status == "HEALTHY":
@@ -1967,6 +2118,7 @@ def check_odoo_addon_health(
             "files_scanned": files_scanned,
             "total_errors": total_errors,
             "total_warnings": total_warnings,
+            "cross_file_issues": len(cross_file_issues),
         },
         "audit_breakdown": {
             "manifest": {
@@ -1979,6 +2131,20 @@ def check_odoo_addon_health(
             "views": views_audit,
             "models": models_audit,
             "security": security_audit,
+            "cross_file_consistency": {
+                "issues": cross_file_issues,
+                "total_issues": len(cross_file_issues),
+                "new_models_checked": len([
+                    m
+                    for m, inf in addon_models_by_name.items()
+                    if not inf.get("inherit") or inf.get("inherit") != m
+                ]),
+                "views_checked": len([
+                    v
+                    for v in all_views
+                    if v.get("target_model") in addon_models_by_name
+                ]),
+            },
         },
         "suggestions": suggestions,
     }

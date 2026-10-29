@@ -98,11 +98,8 @@ Capabilities include:
 - **Views & Data Audit**: Discovers and audits all declared and directory XML view/data files.
 - **Python Models Audit**: Automatically discovers and inspects all model files in `models/`.
 - **Security Audit**: Audits `security/ir.model.access.csv` and security XML rules.
-- **Consolidated Health Scoring**: Assigns an overall status (`HEALTHY`, `NEEDS_ATTENTION`, `CRITICAL_ISSUES`) with file counts, error/warning summaries, and prioritized action suggestions.
-
-
-
-
+- **Cross-File Consistency Audit**: Cross-references models, views, and security files within the addon to detect custom models missing security access rules and XML view `<field>` tags referencing undeclared model fields.
+- **Consolidated Health Scoring**: Assigns an overall status (`HEALTHY`, `NEEDS_ATTENTION`, `CRITICAL_ISSUES`) with file counts, error/warning summaries, cross-file issues, and prioritized action suggestions.
 
 ## Requirements
 
@@ -141,7 +138,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 85 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, unified health check, entry points, and edge cases.
+The current test suite contains 90 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, unified health check, entry points, and edge cases.
 
 ## Client Configuration
 

@@ -1367,3 +1367,132 @@ def test_main_entry_point_calls_mcp_run():
     with patch("server.mcp.run") as mock_run:
         main()
         mock_run.assert_called_once()
+
+
+def test_addon_health_detects_missing_model_access_rule(tmp_path):
+    addon_dir = tmp_path / "missing_sec_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Empty the CSV file (except header) so custom.order has no access rules
+    (addon_dir / "security" / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "NEEDS_ATTENTION"
+    assert result["summary"]["cross_file_issues"] >= 1
+    issues = result["audit_breakdown"]["cross_file_consistency"]["issues"]
+    assert any(i["code"] == "MISSING_MODEL_ACCESS_RULE" and "custom.order" in i["message"] for i in issues)
+    assert any("ir.model.access.csv" in s for s in result["suggestions"])
+
+
+def test_addon_health_detects_undeclared_view_field(tmp_path):
+    addon_dir = tmp_path / "bad_view_field_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Add an undeclared field to the view arch
+    (addon_dir / "views" / "order_views.xml").write_text(
+        "<odoo>\n"
+        "    <record id=\"view_custom_order_form\" model=\"ir.ui.view\">\n"
+        "        <field name=\"name\">custom.order.form</field>\n"
+        "        <field name=\"model\">custom.order</field>\n"
+        "        <field name=\"arch\" type=\"xml\">\n"
+        "            <form>\n"
+        "                <field name=\"name\"/>\n"
+        "                <field name=\"nonexistent_field\"/>\n"
+        "            </form>\n"
+        "        </field>\n"
+        "    </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "NEEDS_ATTENTION"
+    issues = result["audit_breakdown"]["cross_file_consistency"]["issues"]
+    assert any(
+        i["code"] == "UNDECLARED_VIEW_FIELD"
+        and i["element"] == "nonexistent_field"
+        and "custom.order" in i["message"]
+        for i in issues
+    )
+    assert any("view field references" in s.lower() for s in result["suggestions"])
+
+
+def test_addon_health_allows_standard_odoo_base_fields(tmp_path):
+    addon_dir = tmp_path / "base_fields_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Use standard base fields (id, display_name, create_date, active) in view
+    (addon_dir / "views" / "order_views.xml").write_text(
+        "<odoo>\n"
+        "    <record id=\"view_custom_order_tree\" model=\"ir.ui.view\">\n"
+        "        <field name=\"name\">custom.order.tree</field>\n"
+        "        <field name=\"model\">custom.order</field>\n"
+        "        <field name=\"arch\" type=\"xml\">\n"
+        "            <tree>\n"
+        "                <field name=\"id\"/>\n"
+        "                <field name=\"display_name\"/>\n"
+        "                <field name=\"name\"/>\n"
+        "                <field name=\"create_date\"/>\n"
+        "                <field name=\"active\"/>\n"
+        "            </tree>\n"
+        "        </field>\n"
+        "    </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "HEALTHY"
+    assert result["summary"]["cross_file_issues"] == 0
+
+
+def test_addon_health_inherited_models_exempt_from_missing_access_rule(tmp_path):
+    addon_dir = tmp_path / "inherit_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Replace model with an inherited model (e.g. res.partner extension) without _name
+    (addon_dir / "models" / "order.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class PartnerExtension(models.Model):\n"
+        "    _inherit = 'res.partner'\n"
+        "    loyalty_points = fields.Integer(string='Loyalty Points')\n",
+        encoding="utf-8",
+    )
+
+    # Empty access CSV since res.partner already has security in base
+    (addon_dir / "security" / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    # Should NOT flag MISSING_MODEL_ACCESS_RULE for inherited model
+    issues = result["audit_breakdown"]["cross_file_consistency"]["issues"]
+    assert not any(i["code"] == "MISSING_MODEL_ACCESS_RULE" for i in issues)
+
+
+def test_addon_health_cross_file_consistency_breakdown_structure(tmp_path):
+    addon_dir = tmp_path / "structure_addon"
+    _create_full_valid_addon(addon_dir)
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    cross_sec = result["audit_breakdown"]["cross_file_consistency"]
+    assert "issues" in cross_sec
+    assert "total_issues" in cross_sec
+    assert "new_models_checked" in cross_sec
+    assert "views_checked" in cross_sec
+    assert cross_sec["new_models_checked"] == 1
+    assert cross_sec["views_checked"] == 1
