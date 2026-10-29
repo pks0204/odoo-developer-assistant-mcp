@@ -1740,5 +1740,249 @@ def analyze_odoo_security(
     }
 
 
+@mcp.tool()
+def check_odoo_addon_health(
+    addon_path: str,
+    addons_directories: list[str] | None = None,
+) -> dict:
+    """Run a comprehensive static health audit for an entire Odoo addon directory,
+    evaluating the manifest, dependencies, XML views, Python models, and security rules.
+
+    Args:
+        addon_path: Absolute or relative path to the Odoo addon directory.
+        addons_directories: Optional list of directory paths containing other addons
+            to check module dependencies against.
+    """
+    if not isinstance(addon_path, str) or not addon_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide an addon directory path as text.",
+        }
+
+    if addons_directories is not None and (
+        not isinstance(addons_directories, list)
+        or not all(isinstance(d, str) for d in addons_directories)
+    ):
+        return {
+            "success": False,
+            "error": "addons_directories must be a list of directory path strings.",
+        }
+
+    try:
+        resolved_addon = Path(addon_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid addon path: {exc}",
+        }
+
+    if not resolved_addon.exists():
+        return {
+            "success": False,
+            "error": f"Addon directory does not exist: {resolved_addon}",
+        }
+
+    if not resolved_addon.is_dir():
+        return {
+            "success": False,
+            "error": f"Path is not a directory: {resolved_addon}",
+        }
+
+    manifest_path = resolved_addon / "__manifest__.py"
+    if not manifest_path.is_file():
+        return {
+            "success": False,
+            "error": f"__manifest__.py not found in addon directory: {resolved_addon}",
+        }
+
+    # 1. Manifest audit
+    manifest_res = validate_odoo_manifest(str(resolved_addon))
+    if not manifest_res.get("success", False):
+        return {
+            "success": False,
+            "error": f"Manifest validation error: {manifest_res.get('error')}",
+        }
+
+    # 2. Dependency audit (if addons_directories provided)
+    dep_info = {"checked": False}
+    if addons_directories:
+        try:
+            source = manifest_path.read_text(encoding="utf-8")
+            tree = ast.parse(source)
+            manifest_dict = ast.literal_eval(tree.body[0].value)
+            deps = manifest_dict.get("depends", [])
+            dep_status = {}
+            roots = [Path(d).expanduser().resolve() for d in addons_directories]
+
+            for dep in deps:
+                found_in = [str(r) for r in roots if (r / dep).is_dir()]
+                dep_status[dep] = {
+                    "status": "found" if found_in else "not found in supplied directories",
+                    "found_in": found_in,
+                }
+            dep_info = {
+                "checked": True,
+                "dependency_status": dep_status,
+            }
+        except Exception as exc:
+            dep_info = {"checked": False, "error": str(exc)}
+
+    # 3. XML Views & Data Audit
+    xml_files_to_check = set()
+    for section in ("data", "demo"):
+        for item in manifest_res.get("checked_files", []):
+            p = item.get("path")
+            if p and p.endswith(".xml"):
+                resolved_p = (resolved_addon / p).resolve()
+                if resolved_p.is_file():
+                    xml_files_to_check.add(resolved_p)
+
+    for subdir_name in ("views", "data"):
+        subdir = resolved_addon / subdir_name
+        if subdir.is_dir():
+            for xml_file in subdir.glob("**/*.xml"):
+                if xml_file.is_file():
+                    xml_files_to_check.add(xml_file.resolve())
+
+    views_audit = []
+    for xml_path in sorted(xml_files_to_check):
+        rel_path = (
+            str(xml_path.relative_to(resolved_addon))
+            if xml_path.is_relative_to(resolved_addon)
+            else str(xml_path)
+        )
+        xml_analysis = analyze_odoo_xml_view(
+            xml_path=str(xml_path), addon_path=str(resolved_addon)
+        )
+        views_audit.append({
+            "file": rel_path,
+            "valid": xml_analysis.get("valid", False),
+            "errors": xml_analysis.get("errors", []),
+            "warnings": xml_analysis.get("warnings", []),
+            "info": xml_analysis.get("info", []),
+        })
+
+    # 4. Python Models Audit
+    models_audit = []
+    models_dir = resolved_addon / "models"
+    if models_dir.is_dir():
+        for py_file in sorted(models_dir.glob("**/*.py")):
+            if py_file.name == "__init__.py":
+                continue
+            rel_path = str(py_file.relative_to(resolved_addon))
+            py_analysis = analyze_odoo_python_model(
+                python_path=str(py_file), addon_path=str(resolved_addon)
+            )
+            models_audit.append({
+                "file": rel_path,
+                "valid": py_analysis.get("valid", False),
+                "models_found": len(py_analysis.get("models_found", [])),
+                "errors": py_analysis.get("errors", []),
+                "warnings": py_analysis.get("warnings", []),
+            })
+
+    # 5. Security Audit
+    security_audit = []
+    security_dir = resolved_addon / "security"
+    if security_dir.is_dir():
+        for sec_file in sorted(security_dir.iterdir()):
+            if (
+                sec_file.is_file()
+                and sec_file.suffix.lower() in (".csv", ".xml")
+                and not sec_file.name.startswith(".")
+            ):
+                rel_path = str(sec_file.relative_to(resolved_addon))
+                sec_analysis = analyze_odoo_security(
+                    file_path=str(sec_file), addon_path=str(resolved_addon)
+                )
+                security_audit.append({
+                    "file": rel_path,
+                    "valid": sec_analysis.get("valid", False),
+                    "file_type": sec_analysis.get("file_type", "csv"),
+                    "total_rules": sec_analysis.get("summary", {}).get(
+                        "total_rules", 0
+                    ),
+                    "errors": sec_analysis.get("errors", []),
+                    "warnings": sec_analysis.get("warnings", []),
+                })
+
+    # Aggregates
+    manifest_valid = manifest_res.get("valid", True)
+    manifest_errors_count = len(manifest_res.get("missing_fields", [])) + len(
+        manifest_res.get("missing_files", [])
+    )
+
+    views_errors_count = sum(len(v["errors"]) for v in views_audit)
+    views_warnings_count = sum(len(v["warnings"]) for v in views_audit)
+
+    models_errors_count = sum(len(m["errors"]) for m in models_audit)
+    models_warnings_count = sum(len(m["warnings"]) for m in models_audit)
+
+    sec_errors_count = sum(len(s["errors"]) for s in security_audit)
+    sec_warnings_count = sum(len(s["warnings"]) for s in security_audit)
+
+    total_errors = (
+        manifest_errors_count
+        + views_errors_count
+        + models_errors_count
+        + sec_errors_count
+    )
+    total_warnings = (
+        views_warnings_count + models_warnings_count + sec_warnings_count
+    )
+
+    files_scanned = (
+        1 + len(views_audit) + len(models_audit) + len(security_audit)
+    )
+
+    if total_errors > 0 or not manifest_valid:
+        health_status = "CRITICAL_ISSUES"
+    elif total_warnings > 0:
+        health_status = "NEEDS_ATTENTION"
+    else:
+        health_status = "HEALTHY"
+
+    suggestions = []
+    if not manifest_valid:
+        suggestions.extend(manifest_res.get("suggestions", []))
+    if views_errors_count > 0:
+        suggestions.append(f"Fix {views_errors_count} error(s) in view XML files.")
+    if models_errors_count > 0:
+        suggestions.append(f"Fix {models_errors_count} error(s) in Python models.")
+    if sec_errors_count > 0:
+        suggestions.append(f"Fix {sec_errors_count} error(s) in security files.")
+    if total_warnings > 0:
+        suggestions.append(f"Review {total_warnings} warning(s) across the addon.")
+    if health_status == "HEALTHY":
+        suggestions.append(
+            "All static checks passed. The addon is ready for testing in an active Odoo instance."
+        )
+
+    return {
+        "success": True,
+        "addon_name": resolved_addon.name,
+        "addon_path": str(resolved_addon),
+        "health_status": health_status,
+        "summary": {
+            "files_scanned": files_scanned,
+            "total_errors": total_errors,
+            "total_warnings": total_warnings,
+        },
+        "audit_breakdown": {
+            "manifest": {
+                "valid": manifest_valid,
+                "missing_files": manifest_res.get("missing_files", []),
+                "missing_fields": manifest_res.get("missing_fields", []),
+                "field_issues": manifest_res.get("field_issues", []),
+            },
+            "dependencies": dep_info,
+            "views": views_audit,
+            "models": models_audit,
+            "security": security_audit,
+        },
+        "suggestions": suggestions,
+    }
+
+
 if __name__ == "__main__":
     mcp.run()

@@ -88,6 +88,19 @@ Capabilities include:
 - **Global Rule Detection**: Identifies rules with empty `group_id:id` that grant global permissions across all users.
 - **Security XML Analysis**: Validates `ir.rule` record definitions to ensure `model_id` and `domain_force` are declared.
 
+### 7. Unified Odoo Addon Health Check
+
+The `check_odoo_addon_health` tool acts as a single, comprehensive audit command for an entire Odoo addon directory. It orchestrates manifest, view, model, and security analyzers into a consolidated diagnostic report.
+
+Capabilities include:
+
+- **Manifest & Dependency Audit**: Verifies manifest integrity and checks cross-directory dependency resolution.
+- **Views & Data Audit**: Discovers and audits all declared and directory XML view/data files.
+- **Python Models Audit**: Automatically discovers and inspects all model files in `models/`.
+- **Security Audit**: Audits `security/ir.model.access.csv` and security XML rules.
+- **Consolidated Health Scoring**: Assigns an overall status (`HEALTHY`, `NEEDS_ATTENTION`, `CRITICAL_ISSUES`) with file counts, error/warning summaries, and prioritized action suggestions.
+
+
 
 
 
@@ -128,7 +141,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 69 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, and edge cases.
+The current test suite contains 84 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, unified health check, and edge cases.
 
 ## Run with MCP Inspector
 
@@ -187,6 +200,7 @@ odoo-developer-assistant/
 - XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
 - Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
 - Security analysis is static. It verifies CSV access rule syntax, model ID prefixes, and XML record rule definitions, but does not confirm whether referenced security groups exist in an active Odoo database.
+- The unified addon health check performs static analysis across files; complete behavioral verification requires testing the addon inside an active Odoo runtime environment.
 - The tools do not currently connect to or modify an Odoo database.
 
 ## Future Improvements

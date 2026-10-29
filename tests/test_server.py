@@ -6,6 +6,7 @@ from server import (
     analyze_odoo_python_model,
     analyze_odoo_security,
     analyze_odoo_xml_view,
+    check_odoo_addon_health,
     inspect_odoo_module,
     validate_odoo_manifest,
 )
@@ -1078,3 +1079,283 @@ def test_analyze_security_non_string_input():
 
     assert result["success"] is False
     assert "error" in result
+
+
+# --------------------------------------------------
+# Tests for check_odoo_addon_health
+# --------------------------------------------------
+
+def _create_full_valid_addon(addon_dir: Path) -> None:
+    """Helper to create a fully valid Odoo addon."""
+    addon_dir.mkdir(parents=True, exist_ok=True)
+    (addon_dir / "__init__.py").write_text("# -*- coding: utf-8 -*-", encoding="utf-8")
+
+    manifest = {
+        "name": "Full Valid Addon",
+        "version": "18.0.1.0.0",
+        "depends": ["base"],
+        "data": [
+            "security/ir.model.access.csv",
+            "views/order_views.xml",
+        ],
+        "installable": True,
+    }
+    (addon_dir / "__manifest__.py").write_text(repr(manifest), encoding="utf-8")
+
+    models_dir = addon_dir / "models"
+    models_dir.mkdir()
+    (models_dir / "__init__.py").write_text("from . import order", encoding="utf-8")
+    (models_dir / "order.py").write_text(
+        "from odoo import models, fields, api\n\n"
+        "class CustomOrder(models.Model):\n"
+        "    _name = 'custom.order'\n"
+        "    _description = 'Custom Order'\n"
+        "    name = fields.Char(string='Reference')\n"
+        "    partner_id = fields.Many2one('res.partner', string='Partner')\n",
+        encoding="utf-8",
+    )
+
+    views_dir = addon_dir / "views"
+    views_dir.mkdir()
+    (views_dir / "order_views.xml").write_text(
+        "<odoo>\n"
+        "    <record id=\"view_custom_order_form\" model=\"ir.ui.view\">\n"
+        "        <field name=\"name\">custom.order.form</field>\n"
+        "        <field name=\"model\">custom.order</field>\n"
+        "        <field name=\"arch\" type=\"xml\">\n"
+        "            <form><field name=\"name\"/></form>\n"
+        "        </field>\n"
+        "    </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    security_dir = addon_dir / "security"
+    security_dir.mkdir()
+    (security_dir / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_custom_order,custom.order,model_custom_order,base.group_user,1,1,1,1\n",
+        encoding="utf-8",
+    )
+
+
+def test_addon_health_clean_addon(tmp_path):
+    addon_dir = tmp_path / "clean_addon"
+    _create_full_valid_addon(addon_dir)
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "HEALTHY"
+    assert result["summary"]["total_errors"] == 0
+    assert result["summary"]["total_warnings"] == 0
+    assert result["summary"]["files_scanned"] >= 3
+
+
+def test_addon_health_missing_manifest(tmp_path):
+    no_manifest_dir = tmp_path / "no_manifest"
+    no_manifest_dir.mkdir()
+
+    result = check_odoo_addon_health(str(no_manifest_dir))
+
+    assert result["success"] is False
+    assert "manifest" in result["error"].lower()
+
+
+def test_addon_health_nonexistent_directory(tmp_path):
+    nonexistent = tmp_path / "nonexistent"
+
+    result = check_odoo_addon_health(str(nonexistent))
+
+    assert result["success"] is False
+    assert "not exist" in result["error"].lower()
+
+
+def test_addon_health_file_as_addon_path(tmp_path):
+    dummy_file = tmp_path / "dummy.txt"
+    dummy_file.write_text("hello", encoding="utf-8")
+
+    result = check_odoo_addon_health(str(dummy_file))
+
+    assert result["success"] is False
+    assert "directory" in result["error"].lower()
+
+
+def test_addon_health_critical_issues_on_manifest_error(tmp_path):
+    addon_dir = tmp_path / "manifest_err_addon"
+    addon_dir.mkdir()
+    manifest = {
+        "name": "Broken Manifest Addon",
+        "version": "18.0.1.0.0",
+        "depends": ["base"],
+        "data": ["views/nonexistent_file.xml"],
+    }
+    (addon_dir / "__manifest__.py").write_text(repr(manifest), encoding="utf-8")
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "CRITICAL_ISSUES"
+    assert result["summary"]["total_errors"] > 0
+    assert len(result["audit_breakdown"]["manifest"]["missing_files"]) > 0
+
+
+def test_addon_health_detects_xml_syntax_error(tmp_path):
+    addon_dir = tmp_path / "bad_xml_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Break the view XML
+    (addon_dir / "views" / "order_views.xml").write_text(
+        "<odoo><record id='view1'><field name='name'>Broken</record></odoo>",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "CRITICAL_ISSUES"
+    assert any(not v["valid"] for v in result["audit_breakdown"]["views"])
+
+
+def test_addon_health_detects_python_model_error(tmp_path):
+    addon_dir = tmp_path / "bad_py_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Break the model
+    (addon_dir / "models" / "order.py").write_text(
+        "from odoo import models, fields\n"
+        "class BrokenModel(models.Model):\n"
+        "    _name = 'broken.model'\n"
+        "    _description = 'Broken'\n"
+        "    partner_id = fields.Many2one()\n",  # Missing comodel
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "CRITICAL_ISSUES"
+    assert any(not m["valid"] for m in result["audit_breakdown"]["models"])
+
+
+def test_addon_health_detects_security_csv_error(tmp_path):
+    addon_dir = tmp_path / "bad_sec_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Break the ACL CSV (missing model_ prefix)
+    (addon_dir / "security" / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_custom_order,custom.order,custom_order,base.group_user,1,1,1,1\n",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "CRITICAL_ISSUES"
+    assert any(not s["valid"] for s in result["audit_breakdown"]["security"])
+
+
+def test_addon_health_warning_status(tmp_path):
+    addon_dir = tmp_path / "warning_addon"
+    _create_full_valid_addon(addon_dir)
+
+    # Remove description from model (triggers warning, but not error)
+    (addon_dir / "models" / "order.py").write_text(
+        "from odoo import models, fields\n"
+        "class WarningModel(models.Model):\n"
+        "    _name = 'warning.model'\n"
+        "    name = fields.Char(string='Name')\n",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "NEEDS_ATTENTION"
+    assert result["summary"]["total_errors"] == 0
+    assert result["summary"]["total_warnings"] > 0
+
+
+def test_addon_health_with_dependencies(tmp_path):
+    addon_dir = tmp_path / "dep_addon"
+    _create_full_valid_addon(addon_dir)
+
+    other_addons = tmp_path / "community_addons"
+    other_addons.mkdir()
+    (other_addons / "base").mkdir()
+
+    result = check_odoo_addon_health(
+        addon_path=str(addon_dir),
+        addons_directories=[str(other_addons)],
+    )
+
+    assert result["success"] is True
+    assert result["audit_breakdown"]["dependencies"]["checked"] is True
+    assert result["audit_breakdown"]["dependencies"]["dependency_status"]["base"]["status"] == "found"
+
+
+def test_addon_health_without_models_or_security(tmp_path):
+    addon_dir = tmp_path / "views_only_addon"
+    addon_dir.mkdir()
+    manifest = {
+        "name": "Views Only Addon",
+        "version": "18.0.1.0.0",
+        "depends": ["base"],
+        "data": ["views/simple_view.xml"],
+    }
+    (addon_dir / "__manifest__.py").write_text(repr(manifest), encoding="utf-8")
+    views_dir = addon_dir / "views"
+    views_dir.mkdir()
+    (views_dir / "simple_view.xml").write_text(
+        "<odoo><record id='v1' model='ir.ui.view'><field name='name'>V1</field><field name='model'>res.partner</field><field name='arch' type='xml'><form/></field></record></odoo>",
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert result["health_status"] == "HEALTHY"
+    assert len(result["audit_breakdown"]["models"]) == 0
+    assert len(result["audit_breakdown"]["security"]) == 0
+
+
+def test_addon_health_non_string_input():
+    result = check_odoo_addon_health(None)
+
+    assert result["success"] is False
+    assert "error" in result
+
+
+def test_addon_health_invalid_addons_directories_type(tmp_path):
+    addon_dir = tmp_path / "test_addon"
+    _create_full_valid_addon(addon_dir)
+
+    result = check_odoo_addon_health(
+        addon_path=str(addon_dir),
+        addons_directories="invalid_string_not_list",
+    )
+
+    assert result["success"] is False
+    assert "list" in result["error"].lower()
+
+
+def test_addon_health_sample_addon_fixture():
+    sample_addon = Path("sample_addons/my_custom_module")
+
+    result = check_odoo_addon_health(str(sample_addon))
+
+    assert result["success"] is True
+    assert result["health_status"] == "CRITICAL_ISSUES"
+    assert len(result["audit_breakdown"]["manifest"]["missing_files"]) == 2
+
+
+def test_addon_health_aggregated_suggestions(tmp_path):
+    addon_dir = tmp_path / "suggestions_addon"
+    _create_full_valid_addon(addon_dir)
+
+    result = check_odoo_addon_health(str(addon_dir))
+
+    assert result["success"] is True
+    assert isinstance(result["suggestions"], list)
+    assert len(result["suggestions"]) > 0
