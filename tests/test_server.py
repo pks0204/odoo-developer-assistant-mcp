@@ -10,6 +10,7 @@ from server import (
     check_odoo_addon_health,
     inspect_odoo_module,
     main,
+    migrate_odoo_addon,
     validate_odoo_manifest,
     verify_odoo_live_metadata,
 )
@@ -1695,3 +1696,248 @@ def test_verify_live_metadata_credentials_never_leaked():
 
         result_str = str(result)
         assert secret not in result_str
+
+
+# --------------------------------------------------
+# Tests for migrate_odoo_addon
+# --------------------------------------------------
+
+def test_migrate_addon_invalid_path(tmp_path: Path):
+    # Non-string input
+    res_num = migrate_odoo_addon(12345)
+    assert res_num["success"] is False
+    assert "Please provide an addon directory path" in res_num["error"]
+
+    # Nonexistent path
+    res_non = migrate_odoo_addon(str(tmp_path / "does_not_exist"))
+    assert res_non["success"] is False
+    assert "does not exist" in res_non["error"]
+
+    # Path is a file, not a directory
+    test_file = tmp_path / "some_file.txt"
+    test_file.write_text("hello", encoding="utf-8")
+    res_file = migrate_odoo_addon(str(test_file))
+    assert res_file["success"] is False
+    assert "is a file, not a directory" in res_file["error"]
+
+    # Directory missing __manifest__.py
+    empty_dir = tmp_path / "empty_module"
+    empty_dir.mkdir()
+    res_empty = migrate_odoo_addon(str(empty_dir))
+    assert res_empty["success"] is False
+    assert "No __manifest__.py found" in res_empty["error"]
+
+
+def test_migrate_addon_dry_run_preserves_files(tmp_path: Path):
+    addon = tmp_path / "demo_module"
+    addon.mkdir()
+    manifest_file = addon / "__manifest__.py"
+    manifest_content = (
+        "{\n"
+        "    'name': 'Demo',\n"
+        "    'version': '16.0.1.0.0',\n"
+        "    'depends': ['base'],\n"
+        "}\n"
+    )
+    manifest_file.write_text(manifest_content, encoding="utf-8")
+
+    views_dir = addon / "views"
+    views_dir.mkdir()
+    view_file = views_dir / "demo_views.xml"
+    view_content = (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<odoo>\n'
+        '    <record id="view_demo_tree" model="ir.ui.view">\n'
+        '        <field name="name">demo.tree</field>\n'
+        '        <field name="model">demo.model</field>\n'
+        '        <field name="arch" type="xml">\n'
+        '            <tree string="Demos" editable="bottom">\n'
+        '                <field name="name" attrs="{\'invisible\': [(\'state\', \'=\', \'done\')]}"/>\n'
+        '            </tree>\n'
+        '        </field>\n'
+        '    </record>\n'
+        '</odoo>\n'
+    )
+    view_file.write_text(view_content, encoding="utf-8")
+
+    result = migrate_odoo_addon(str(addon), target_version="19.0", dry_run=True, scaffold_openupgrade=True)
+
+    assert result["success"] is True
+    assert result["dry_run"] is True
+    assert result["backup_path"] is None
+    assert result["target_version"] == "19.0"
+    assert result["summary"]["manifest_version_bumped"] is True
+    assert result["summary"]["xml_tree_tags_migrated"] == 2
+    assert result["summary"]["attrs_converted"] == 1
+    assert result["summary"]["files_modified"] == 2
+    assert result["openupgrade"]["scaffolded"] is True
+
+    # Check that disk contents are strictly untouched in dry_run
+    assert manifest_file.read_text(encoding="utf-8") == manifest_content
+    assert view_file.read_text(encoding="utf-8") == view_content
+    assert not (addon / "_migration_backups").exists()
+    assert not (addon / "migrations").exists()
+
+
+def test_migrate_addon_manifest_version_bump(tmp_path: Path):
+    addon = tmp_path / "version_module"
+    addon.mkdir()
+    manifest_file = addon / "__manifest__.py"
+    manifest_file.write_text(
+        "{\n    'name': 'Version Test',\n    'version': '17.0.2.3.4',\n}\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), target_version="19.0", dry_run=False, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["manifest_version_bumped"] is True
+
+    updated_manifest = manifest_file.read_text(encoding="utf-8")
+    assert "'version': '19.0.2.3.4'" in updated_manifest
+
+
+def test_migrate_addon_tree_to_list(tmp_path: Path):
+    addon = tmp_path / "tree_module"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'Tree', 'version': '18.0.1.0'}", encoding="utf-8")
+
+    views_dir = addon / "views"
+    views_dir.mkdir()
+    view_file = views_dir / "tree_view.xml"
+    view_file.write_text(
+        '<odoo>\n'
+        '    <tree string="Items" create="true">\n'
+        '        <field name="tree_structure"/>\n'
+        '    </tree>\n'
+        '</odoo>\n',
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=False, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["xml_tree_tags_migrated"] == 2
+
+    updated = view_file.read_text(encoding="utf-8")
+    assert '<list string="Items" create="true">' in updated
+    assert '</list>' in updated
+    assert '<field name="tree_structure"/>' in updated
+    assert '<tree' not in updated
+
+
+def test_migrate_addon_attrs_to_direct_expressions(tmp_path: Path):
+    addon = tmp_path / "attrs_module"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'Attrs', 'version': '16.0.1.0'}", encoding="utf-8")
+
+    view_file = addon / "view.xml"
+    view_file.write_text(
+        '<odoo>\n'
+        '    <form>\n'
+        '        <field name="partner_id" attrs="{\'invisible\': [(\'state\', \'=\', \'draft\')], \'readonly\': [(\'is_locked\', \'=\', True)]}"/>\n'
+        '        <field name="notes" attrs="{\'invisible\': [\'|\', (\'state\', \'=\', \'cancel\'), (\'active\', \'=\', False)]}"/>\n'
+        '    </form>\n'
+        '</odoo>\n',
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=False, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["attrs_converted"] == 2
+
+    updated = view_file.read_text(encoding="utf-8")
+    assert 'invisible="state == \'draft\'"' in updated
+    assert 'readonly="is_locked"' in updated
+    assert 'invisible="state == \'cancel\' or not active"' in updated
+    assert 'attrs=' not in updated
+
+
+def test_migrate_addon_states_conversion(tmp_path: Path):
+    addon = tmp_path / "states_module"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'States', 'version': '16.0.1.0'}", encoding="utf-8")
+
+    view_file = addon / "view.xml"
+    view_file.write_text(
+        '<odoo>\n'
+        '    <form>\n'
+        '        <button name="action_confirm" states="draft"/>\n'
+        '        <button name="action_cancel" states="draft,sent,waiting"/>\n'
+        '    </form>\n'
+        '</odoo>\n',
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=False, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["states_converted"] == 2
+
+    updated = view_file.read_text(encoding="utf-8")
+    assert 'invisible="state != \'draft\'"' in updated
+    assert "invisible=\"state not in ('draft', 'sent', 'waiting')\"" in updated
+    assert 'states=' not in updated
+
+
+def test_migrate_addon_apply_creates_backup(tmp_path: Path):
+    addon = tmp_path / "backup_module"
+    addon.mkdir()
+    manifest = addon / "__manifest__.py"
+    manifest.write_text("{'name': 'Backup', 'version': '16.0.1.0.0'}\n", encoding="utf-8")
+
+    view = addon / "view.xml"
+    view.write_text('<odoo><tree string="Test"/></odoo>\n', encoding="utf-8")
+
+    result = migrate_odoo_addon(str(addon), dry_run=False, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["backup_path"] is not None
+
+    backup_dir = Path(result["backup_path"])
+    assert backup_dir.exists()
+    assert backup_dir.is_dir()
+
+    # The backup should preserve the original un-migrated files
+    backup_manifest = (backup_dir / "__manifest__.py").read_text(encoding="utf-8")
+    assert "'16.0.1.0.0'" in backup_manifest
+
+    backup_view = (backup_dir / "view.xml").read_text(encoding="utf-8")
+    assert '<tree string="Test"/>' in backup_view
+
+    # While the actual files were updated
+    assert '<list string="Test"/>' in view.read_text(encoding="utf-8")
+    assert "'19.0.1.0.0'" in manifest.read_text(encoding="utf-8")
+
+
+def test_migrate_addon_scaffolds_openupgrade_files(tmp_path: Path):
+    addon = tmp_path / "openupgrade_module"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'OU', 'version': '17.0.1.0'}", encoding="utf-8")
+
+    result = migrate_odoo_addon(str(addon), target_version="19.0", dry_run=False, scaffold_openupgrade=True)
+    assert result["success"] is True
+    assert result["openupgrade"]["scaffolded"] is True
+
+    migrations_dir = addon / "migrations" / "19.0.1.0"
+    pre_file = migrations_dir / "pre-migration.py"
+    post_file = migrations_dir / "post-migration.py"
+    readme_file = migrations_dir / "README.md"
+
+    assert pre_file.exists()
+    assert post_file.exists()
+    assert readme_file.exists()
+
+    pre_content = pre_file.read_text(encoding="utf-8")
+    assert "OpenUpgrade pre-migration script for Odoo 19.0" in pre_content
+    assert "from openupgradelib import openupgrade" in pre_content
+    assert "def migrate(env, version):" in pre_content
+
+    post_content = post_file.read_text(encoding="utf-8")
+    assert "OpenUpgrade post-migration script for Odoo 19.0" in post_content
+    assert "def migrate(env, version):" in post_content
+
+    readme_content = readme_file.read_text(encoding="utf-8")
+    assert "upgrading this addon to Odoo 19.0" in readme_content
+    assert "-u openupgrade_module" in readme_content
+
+    # Test idempotency: custom modifications in pre-migration.py must not be overwritten
+    pre_file.write_text("# Custom migration logic here\n", encoding="utf-8")
+    result_second = migrate_odoo_addon(str(addon), target_version="19.0", dry_run=False, scaffold_openupgrade=True)
+    assert pre_file.read_text(encoding="utf-8") == "# Custom migration logic here\n"

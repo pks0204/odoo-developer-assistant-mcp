@@ -113,6 +113,21 @@ Capabilities include:
 - **Credential Protection**: Passwords and API keys are never leaked or stored in responses.
 - **Zero Dependencies**: Powered exclusively by Python's standard library `xmlrpc.client`.
 
+### 9. Odoo Migration & OpenUpgrade Scaffolder
+
+The `migrate_odoo_addon` tool automates the code migration of custom addons from Odoo 16, 17, and 18 to Odoo 19 (Community and Enterprise) and scaffolds OCA OpenUpgrade database migration templates.
+
+Capabilities include:
+- **XML View Modernization**: Automatically converts deprecated `<tree>` tags to `<list>` (mandatory in Odoo 18/19), refactors legacy `attrs="{...}"` dictionaries into direct Python expressions (`invisible="..."`, `readonly="..."`, `required="..."`), and transforms `states="..."` attributes into boolean domain expressions.
+- **Manifest Version Bumping**: Updates `version` declarations in `__manifest__.py` to target version `19.0.x.x` while preserving custom sub-versioning formats.
+- **OpenUpgrade Database Scaffolding**: Automatically scaffolds OCA standard `migrations/19.0.1.0/` structure including:
+  - `pre-migration.py`: Standard template using `openupgradelib.openupgrade` for table, column, and model renaming before Odoo ORM models load.
+  - `post-migration.py`: Standard template for data migrations, compute field backfills, and XML data reloading after models load.
+  - `README.md`: Migration execution guide and CLI commands.
+- **Safety First (Dry-Run & Auto-Backup)**:
+  - Defaults to `dry_run=True`, generating git-compatible unified diffs without modifying files on disk.
+  - When `dry_run=False` is specified, creates a timestamped full backup under `_migration_backups/<timestamp>/` before applying any changes to disk.
+
 ## Requirements
 
 - Python 3.12 or a compatible Python version
@@ -150,7 +165,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 98 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, entry points, and edge cases.
+The current test suite contains 106 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -206,6 +221,7 @@ Once configured, you can prompt your AI assistant with queries like:
 - *"Inspect the XML view at `views/sale_order_views.xml` for structural errors or deprecated syntax."*
 - *"Analyze `models/res_partner.py` for missing inverse fields or incomplete @api decorators."*
 - *"Verify my `security/ir.model.access.csv` permissions file."*
+- *"Migrate my Odoo 16 module at `/path/to/my_addon` to Odoo 19: preview the diffs first with dry_run, then scaffold OpenUpgrade database scripts."*
 
 ## Run with MCP Inspector
 

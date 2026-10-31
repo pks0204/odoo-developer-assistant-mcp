@@ -1,8 +1,11 @@
 import ast
 import csv
+import datetime
+import difflib
 import io
 from pathlib import Path
 import re
+import shutil
 import socket
 import urllib.parse
 import xml.sax
@@ -2467,6 +2470,413 @@ def verify_odoo_live_metadata(
         "models": models_status,
         "fields": fields_status,
         "xml_ids": xml_ids_status,
+        "suggestions": suggestions,
+    }
+
+
+def _eval_domain_ast(domain: list) -> str:
+    """Convert an Odoo domain list into an Odoo 17/18/19 Python boolean expression."""
+    if not isinstance(domain, list):
+        return ""
+
+    stack = []
+    for token in reversed(domain):
+        if token == "|":
+            if len(stack) >= 2:
+                left = stack.pop()
+                right = stack.pop()
+                stack.append(f"({left} or {right})")
+        elif token == "&":
+            if len(stack) >= 2:
+                left = stack.pop()
+                right = stack.pop()
+                stack.append(f"({left} and {right})")
+        elif isinstance(token, (list, tuple)) and len(token) == 3:
+            f, op, val = token
+            if op == "=" and val is True:
+                expr = str(f)
+            elif op == "=" and val is False:
+                expr = f"not {f}"
+            elif op == "!=" and val is True:
+                expr = f"not {f}"
+            elif op == "!=" and val is False:
+                expr = str(f)
+            elif op == "=":
+                expr = f"{f} == {repr(val)}"
+            elif op == "!=":
+                expr = f"{f} != {repr(val)}"
+            elif op == "in":
+                if isinstance(val, (list, tuple)):
+                    val_str = f"({repr(val[0])},)" if len(val) == 1 else f"{tuple(val)}"
+                else:
+                    val_str = repr(val)
+                expr = f"{f} in {val_str}"
+            elif op == "not in":
+                if isinstance(val, (list, tuple)):
+                    val_str = f"({repr(val[0])},)" if len(val) == 1 else f"{tuple(val)}"
+                else:
+                    val_str = repr(val)
+                expr = f"{f} not in {val_str}"
+            elif op in ("<", ">", "<=", ">="):
+                expr = f"{f} {op} {repr(val)}"
+            else:
+                expr = f"{f} {op} {repr(val)}"
+            stack.append(expr)
+
+    if not stack:
+        return ""
+    if len(stack) == 1:
+        res = stack[0]
+        if res.startswith("(") and res.endswith(")"):
+            res = res[1:-1]
+        return res
+    stack.reverse()
+    return " and ".join(stack)
+
+
+ATTRS_PATTERN = re.compile(r'attrs=([\"\'])(.*?)\1', re.DOTALL)
+STATES_PATTERN = re.compile(r'states=([\"\'])(.*?)\1', re.DOTALL)
+TREE_OPEN_PATTERN = re.compile(r'<tree(\s|>)')
+TREE_CLOSE_PATTERN = re.compile(r'</tree>')
+MANIFEST_VERSION_PATTERN = re.compile(r'([\'\"]version[\'\"]\s*:\s*[\'\"])(?:\d+\.\d+)(\.[^\'\"]+)?([\'\"])')
+
+PRE_MIGRATION_TEMPLATE = '''"""OpenUpgrade pre-migration script for Odoo {target_version}.
+
+Executed in PostgreSQL before Odoo models load.
+Use openupgradelib to rename tables, columns, and convert data structures without data loss.
+"""
+import logging
+from openupgradelib import openupgrade
+
+_logger = logging.getLogger(__name__)
+
+
+@openupgrade.migrate()
+def migrate(env, version):
+    _logger.info("Starting pre-migration for database %s to %s", env.cr.dbname, version)
+
+    # Example: Rename a database column
+    # openupgrade.rename_columns(
+    #     env.cr,
+    #     {
+    #         "sale_order": [
+    #             ("old_column_name", "new_column_name"),
+    #         ],
+    #     },
+    # )
+
+    # Example: Rename a model / table
+    # openupgrade.rename_models(
+    #     env.cr,
+    #     [
+    #         ("custom.old.model", "custom.new.model"),
+    #     ],
+    # )
+'''
+
+POST_MIGRATION_TEMPLATE = '''"""OpenUpgrade post-migration script for Odoo {target_version}.
+
+Executed after Odoo models have been loaded and updated in the database.
+Use Python ORM code to compute new fields, re-link records, and clean up.
+"""
+import logging
+from openupgradelib import openupgrade
+
+_logger = logging.getLogger(__name__)
+
+
+@openupgrade.migrate()
+def migrate(env, version):
+    _logger.info("Starting post-migration for database %s to %s", env.cr.dbname, version)
+
+    # Example: Populate newly added compute / stored fields
+    # records = env["custom.order"].search([("new_field", "=", False)])
+    # for rec in records:
+    #     rec.new_field = rec.partner_id.name
+'''
+
+MIGRATIONS_README_TEMPLATE = '''# OpenUpgrade Migration Directory
+
+This directory contains database migration scripts for upgrading this addon to Odoo {target_version}.
+
+## Structure
+- `pre-migration.py`: Runs before model schema updates. Ideal for table and column renames via `openupgradelib`.
+- `post-migration.py`: Runs after models update. Ideal for ORM data transformations and compute field backfills.
+
+## Execution
+Run with OpenUpgrade or invoke via standard Odoo CLI:
+```bash
+odoo-bin -c odoo.conf -u {addon_name} -d <database_name> --stop-after-init
+```
+'''
+
+
+@mcp.tool()
+def migrate_odoo_addon(
+    addon_path: str,
+    target_version: str = "19.0",
+    dry_run: bool = True,
+    scaffold_openupgrade: bool = True,
+) -> dict:
+    """Migrate a custom Odoo addon from Odoo 16/17/18 to Odoo 19 (Community & Enterprise).
+
+    Refactors XML view tags (<tree> -> <list>), converts legacy attrs="..." and states="..."
+    dynamic expressions to modern invisible/readonly/required attributes, bumps manifest
+    version, and scaffolds OCA OpenUpgrade database migration templates.
+
+    Args:
+        addon_path: Absolute or relative path to the Odoo addon directory.
+        target_version: Target Odoo version (default: '19.0').
+        dry_run: If True, previews unified diffs without modifying files on disk.
+            If False, saves an automatic timestamped backup and applies all changes.
+        scaffold_openupgrade: If True, scaffolds standard migrations/19.0.1.0/
+            OpenUpgrade pre-migration and post-migration templates.
+    """
+    if not isinstance(addon_path, str) or not addon_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide an addon directory path as text.",
+        }
+
+    try:
+        resolved_addon = Path(addon_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid addon path: {exc}",
+        }
+
+    if not resolved_addon.exists():
+        return {
+            "success": False,
+            "error": f"Addon directory does not exist: {resolved_addon}",
+        }
+
+    if not resolved_addon.is_dir():
+        return {
+            "success": False,
+            "error": f"Provided path is a file, not a directory: {resolved_addon}",
+        }
+
+    manifest_path = resolved_addon / "__manifest__.py"
+    if not manifest_path.is_file():
+        return {
+            "success": False,
+            "error": f"No __manifest__.py found in addon directory: {resolved_addon}",
+        }
+
+    clean_target = str(target_version).strip()
+    if not clean_target:
+        clean_target = "19.0"
+
+    modified_files = []
+    total_files_scanned = 0
+    tree_converted_count = 0
+    attrs_converted_count = 0
+    states_converted_count = 0
+    manifest_bumped = False
+
+    files_to_write = {}
+
+    # 1. Inspect and bump Manifest
+    total_files_scanned += 1
+    try:
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        new_manifest, count = MANIFEST_VERSION_PATTERN.subn(
+            lambda m: f"{m.group(1)}{clean_target}{m.group(2) or ''}{m.group(3)}",
+            manifest_text,
+        )
+        if count > 0 and new_manifest != manifest_text:
+            manifest_bumped = True
+            diff_lines = list(difflib.unified_diff(
+                manifest_text.splitlines(keepends=True),
+                new_manifest.splitlines(keepends=True),
+                fromfile=f"a/{manifest_path.name}",
+                tofile=f"b/{manifest_path.name}",
+            ))
+            files_to_write[manifest_path] = new_manifest
+            modified_files.append({
+                "file": "__manifest__.py",
+                "type": "manifest",
+                "changes_count": count,
+                "diff": "".join(diff_lines),
+            })
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": f"Failed to read manifest file: {exc}",
+        }
+
+    # 2. Inspect and refactor XML view files
+    xml_files = sorted(resolved_addon.glob("**/*.xml"))
+    for xml_file in xml_files:
+        if xml_file.name.startswith(".") or "_migration_backups" in xml_file.parts:
+            continue
+        total_files_scanned += 1
+        try:
+            content = xml_file.read_text(encoding="utf-8")
+            file_changes = 0
+
+            # Tree -> List
+            new_content, t_open_c = TREE_OPEN_PATTERN.subn(r'<list\1', content)
+            new_content, t_close_c = TREE_CLOSE_PATTERN.subn(r'</list>', new_content)
+            tree_changes = t_open_c + t_close_c
+            tree_converted_count += tree_changes
+            file_changes += tree_changes
+
+            # Attrs -> direct attributes
+            def replace_attrs(match):
+                raw_dict_str = match.group(2)
+                try:
+                    attrs_dict = ast.literal_eval(raw_dict_str)
+                    if not isinstance(attrs_dict, dict):
+                        return match.group(0)
+                except Exception:
+                    return match.group(0)
+
+                replacements = []
+                for attr_name in ("invisible", "readonly", "required"):
+                    if attr_name in attrs_dict:
+                        domain = attrs_dict[attr_name]
+                        expr = _eval_domain_ast(domain)
+                        if expr:
+                            replacements.append(f'{attr_name}="{expr}"')
+                return " ".join(replacements) if replacements else match.group(0)
+
+            new_content, a_c = ATTRS_PATTERN.subn(replace_attrs, new_content)
+            attrs_converted_count += a_c
+            file_changes += a_c
+
+            # States -> invisible
+            def replace_states(match):
+                raw_states = match.group(2)
+                vals = [s.strip() for s in raw_states.split(",") if s.strip()]
+                if not vals:
+                    return match.group(0)
+                if len(vals) == 1:
+                    return f'invisible="state != \'{vals[0]}\'"'
+                tuple_str = f"({', '.join(repr(v) for v in vals)})"
+                return f'invisible="state not in {tuple_str}"'
+
+            new_content, s_c = STATES_PATTERN.subn(replace_states, new_content)
+            states_converted_count += s_c
+            file_changes += s_c
+
+            if file_changes > 0 and new_content != content:
+                rel_path = str(xml_file.relative_to(resolved_addon))
+                diff_lines = list(difflib.unified_diff(
+                    content.splitlines(keepends=True),
+                    new_content.splitlines(keepends=True),
+                    fromfile=f"a/{rel_path}",
+                    tofile=f"b/{rel_path}",
+                ))
+                files_to_write[xml_file] = new_content
+                modified_files.append({
+                    "file": rel_path,
+                    "type": "xml_view",
+                    "changes_count": file_changes,
+                    "diff": "".join(diff_lines),
+                })
+        except Exception:
+            continue
+
+    # 3. OpenUpgrade Scaffolding
+    migrations_dir = resolved_addon / "migrations" / f"{clean_target}.1.0"
+    scaffold_created = False
+    openupgrade_files_planned = []
+
+    if scaffold_openupgrade:
+        pre_file = migrations_dir / "pre-migration.py"
+        post_file = migrations_dir / "post-migration.py"
+        readme_file = migrations_dir / "README.md"
+
+        if not pre_file.exists():
+            openupgrade_files_planned.append(str(pre_file.relative_to(resolved_addon)))
+        if not post_file.exists():
+            openupgrade_files_planned.append(str(post_file.relative_to(resolved_addon)))
+        if not readme_file.exists():
+            openupgrade_files_planned.append(str(readme_file.relative_to(resolved_addon)))
+
+    # 4. Apply changes or prepare dry-run
+    backup_path = None
+    if not dry_run:
+        # Create timestamped backup
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = resolved_addon / "_migration_backups" / timestamp
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = str(backup_dir)
+
+        # Backup & write modified files
+        for target_file, new_text in files_to_write.items():
+            rel = target_file.relative_to(resolved_addon)
+            dest_backup = backup_dir / rel
+            dest_backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target_file, dest_backup)
+            target_file.write_text(new_text, encoding="utf-8")
+
+        # Create OpenUpgrade templates
+        if scaffold_openupgrade:
+            migrations_dir.mkdir(parents=True, exist_ok=True)
+            pre_file = migrations_dir / "pre-migration.py"
+            if not pre_file.exists():
+                pre_file.write_text(PRE_MIGRATION_TEMPLATE.replace("{target_version}", clean_target), encoding="utf-8")
+                scaffold_created = True
+
+            post_file = migrations_dir / "post-migration.py"
+            if not post_file.exists():
+                post_file.write_text(POST_MIGRATION_TEMPLATE.replace("{target_version}", clean_target), encoding="utf-8")
+                scaffold_created = True
+
+            readme_file = migrations_dir / "README.md"
+            if not readme_file.exists():
+                readme_file.write_text(
+                    MIGRATIONS_README_TEMPLATE.replace("{target_version}", clean_target).replace("{addon_name}", resolved_addon.name),
+                    encoding="utf-8",
+                )
+                scaffold_created = True
+    else:
+        scaffold_created = len(openupgrade_files_planned) > 0
+
+    suggestions = []
+    if dry_run:
+        suggestions.append(
+            "Dry run complete. Review the planned diffs above. To apply changes to disk, re-run with dry_run=False."
+        )
+    else:
+        suggestions.append(
+            f"Migration changes applied successfully. Full backup saved to '{backup_path}'."
+        )
+
+    if scaffold_openupgrade:
+        suggestions.append(
+            f"OpenUpgrade migration templates available in 'migrations/{clean_target}.1.0/'. "
+            "Customize pre-migration.py if any database columns or models were renamed."
+        )
+
+    return {
+        "success": True,
+        "addon_name": resolved_addon.name,
+        "addon_path": str(resolved_addon),
+        "target_version": clean_target,
+        "dry_run": dry_run,
+        "backup_path": backup_path,
+        "summary": {
+            "files_scanned": total_files_scanned,
+            "files_modified": len(modified_files),
+            "xml_tree_tags_migrated": tree_converted_count,
+            "attrs_converted": attrs_converted_count,
+            "states_converted": states_converted_count,
+            "manifest_version_bumped": manifest_bumped,
+            "openupgrade_scaffolded": scaffold_created,
+        },
+        "modified_files": modified_files,
+        "openupgrade": {
+            "scaffolded": scaffold_created,
+            "migrations_directory": str(migrations_dir),
+            "files": openupgrade_files_planned if dry_run else [
+                str(migrations_dir / f) for f in ("pre-migration.py", "post-migration.py", "README.md")
+            ],
+        },
         "suggestions": suggestions,
     }
 
