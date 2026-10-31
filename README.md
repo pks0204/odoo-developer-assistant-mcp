@@ -189,6 +189,19 @@ Capabilities include:
   Installs an executable `.git/hooks/pre-commit` hook that automatically checks all staged Odoo files before every commit, rejecting broken code.
 - **Pre-Commit Framework Integration**: Ready-to-use `.pre-commit-hooks.yaml` for repositories using the standard `pre-commit` tool.
 
+### 14. Automated Odoo Code Fixer
+
+The `fix_odoo_addon` tool automatically detects and fixes common Odoo issues across frontend OWL components, XML views, Python models, and security CSV files.
+
+Strictly following the safety principle of **"detect first, preview changes, and modify only with explicit user permission"**:
+- **Dry-run by default (`dry_run=True`)**: Performs analysis and returns clean unified diffs without modifying files on disk.
+- **Permission required to apply (`dry_run=False` or `--apply`)**: Creates an automatic timestamped backup under `_code_fix_backups/<timestamp>/` before writing changes to disk.
+- **Supported Fix Domains**:
+  - **Views (`views`)**: Converts deprecated `<tree>` tags to `<list>`, refactors legacy `attrs="..."` and `states="..."` to direct boolean expressions, converts legacy `t-raw` to `t-out`, and strips leading/trailing whitespace in `<record id="...">`.
+  - **Python Models (`models`)**: Strips obsolete `@api.multi` / `@api.one` decorators, automatically injects `@api.model_create_multi` above `def create(...)`, and modernizes `fields.Date.to_string()` / `fields.Datetime.to_string()` with native `str()`.
+  - **Security CSV (`security`)**: Prepends the mandatory `model_` prefix to raw model names in `ir.model.access.csv`.
+  - **Modern OWL & Frontend (`owl`)**: Prepends `/** @odoo-module **/` to modern ES module components and replaces deprecated `t-raw` with `t-out` in QWeb XML templates.
+
 ## Standalone CLI & Git Pre-Commit Usage
 
 ### 1. Run Health Checks
@@ -203,7 +216,25 @@ odoo-developer-assistant check tests/fixtures/valid_view.xml
 odoo-developer-assistant check /path/to/addon --fail-on-warning
 ```
 
-### 2. Scaffold Tests from Terminal
+### 2. Automatically Fix Common Code Issues
+```bash
+# Preview proposed fixes without modifying files (dry run)
+odoo-developer-assistant fix /path/to/addon
+
+# Explicitly apply fixes with automatic backup
+odoo-developer-assistant fix /path/to/addon --apply
+
+# Restrict fixes to specific domains (e.g., models or views only)
+odoo-developer-assistant fix /path/to/addon --domain models --apply
+
+# Health check with automatic fix preview
+odoo-developer-assistant check /path/to/addon --fix
+
+# Health check and automatically apply fixes
+odoo-developer-assistant check /path/to/addon --fix --apply
+```
+
+### 3. Scaffold Tests from Terminal
 ```bash
 # Preview generated test suites
 odoo-developer-assistant scaffold-tests /path/to/addon
@@ -212,7 +243,7 @@ odoo-developer-assistant scaffold-tests /path/to/addon
 odoo-developer-assistant scaffold-tests /path/to/addon --apply
 ```
 
-### 3. Run Migrations from Terminal
+### 4. Run Migrations from Terminal
 ```bash
 # Preview Odoo 19 migration diffs
 odoo-developer-assistant migrate /path/to/addon --target-version 19.0
@@ -221,7 +252,7 @@ odoo-developer-assistant migrate /path/to/addon --target-version 19.0
 odoo-developer-assistant migrate /path/to/addon --target-version 19.0 --apply
 ```
 
-### 4. Install Git Pre-Commit Hook
+### 5. Install Git Pre-Commit Hook
 ```bash
 # Install pre-commit hook into your local git repository
 odoo-developer-assistant install-hook
@@ -273,7 +304,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 150 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, entry points, and edge cases.
+The current test suite contains 158 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
 
 ## Client Configuration
 

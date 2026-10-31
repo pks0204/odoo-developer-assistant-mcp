@@ -11,10 +11,12 @@ from server import (
     analyze_odoo_xml_view,
     check_odoo_addon_health,
     cli_check,
+    cli_fix,
     cli_install_hook,
     cli_main,
     cli_migrate,
     cli_scaffold_tests,
+    fix_odoo_addon,
     format_cli_report,
     generate_openupgrade_scripts,
     inspect_odoo_module,
@@ -2944,3 +2946,217 @@ def test_format_cli_report():
     assert "[WARN] [Line 20] WARN_1: Minor warning" in report
     assert "[CONSISTENCY] MISSING_RULE: No security rule" in report
     assert "* Fix errors" in report
+
+
+# --------------------------------------------------
+# Tests for fix_odoo_addon & CLI fixer
+# --------------------------------------------------
+
+def test_fix_odoo_addon_invalid_path(tmp_path: Path):
+    # Empty path
+    res_empty = fix_odoo_addon("")
+    assert res_empty["success"] is False
+    assert "Please provide an addon directory path" in res_empty["error"]
+
+    # Nonexistent path
+    res_none = fix_odoo_addon(str(tmp_path / "nonexistent"))
+    assert res_none["success"] is False
+    assert "does not exist" in res_none["error"]
+
+    # Directory missing manifest
+    empty_dir = tmp_path / "no_manifest"
+    empty_dir.mkdir()
+    res_no_manifest = fix_odoo_addon(str(empty_dir))
+    assert res_no_manifest["success"] is False
+    assert "No __manifest__.py found" in res_no_manifest["error"]
+
+
+def test_fix_odoo_addon_dry_run_previews_without_modifying(tmp_path: Path):
+    addon = tmp_path / "fix_mod"
+    _create_full_valid_addon(addon)
+
+    py_file = addon / "models" / "order.py"
+    py_code = (
+        "from odoo import models, fields, api\n\n"
+        "class Order(models.Model):\n"
+        "    _name = 'test.order'\n"
+        "    _description = 'Test Order'\n"
+        "    @api.multi\n"
+        "    def do_action(self):\n"
+        "        pass\n"
+    )
+    py_file.write_text(py_code, encoding="utf-8")
+
+    res = fix_odoo_addon(str(addon), dry_run=True)
+    assert res["success"] is True
+    assert res["dry_run"] is True
+    assert res["summary"]["files_modified"] >= 1
+    assert res["backup_path"] is None
+
+    # Check diff is in modified_files
+    py_changes = [c for c in res["modified_files"] if "models/order.py" in c["file"]]
+    assert len(py_changes) == 1
+    assert "-    @api.multi" in py_changes[0]["diff"]
+
+    # Ensure disk file was untouched
+    assert "@api.multi" in py_file.read_text(encoding="utf-8")
+
+
+def test_fix_odoo_addon_owl_js_and_qweb(tmp_path: Path):
+    addon = tmp_path / "owl_addon"
+    _create_full_valid_addon(addon)
+
+    static_js = addon / "static" / "src" / "components"
+    static_js.mkdir(parents=True, exist_ok=True)
+    js_file = static_js / "widget.js"
+    js_file.write_text("import { Component } from '@odoo/owl';\nexport class Widget extends Component {}\n", encoding="utf-8")
+
+    static_xml = addon / "static" / "src" / "xml"
+    static_xml.mkdir(parents=True, exist_ok=True)
+    qweb_file = static_xml / "template.xml"
+    qweb_file.write_text("<templates><t t-name='test'><div t-raw='raw_html'/></t></templates>", encoding="utf-8")
+
+    res = fix_odoo_addon(str(addon), fix_types=["owl"], dry_run=False)
+    assert res["success"] is True
+    assert res["dry_run"] is False
+
+    # Check JS file was prepended with /** @odoo-module **/
+    js_content = js_file.read_text(encoding="utf-8")
+    assert js_content.startswith("/** @odoo-module **/\n")
+
+    # Check XML template replaced t-raw with t-out
+    qweb_content = qweb_file.read_text(encoding="utf-8")
+    assert "t-out='raw_html'" in qweb_content
+    assert "t-raw" not in qweb_content
+
+
+def test_fix_odoo_addon_security_csv(tmp_path: Path):
+    addon = tmp_path / "sec_addon"
+    _create_full_valid_addon(addon)
+
+    csv_file = addon / "security" / "ir.model.access.csv"
+    csv_file.write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_custom_order,access.custom.order,custom_order,base.group_user,1,1,1,1\n",
+        encoding="utf-8",
+    )
+
+    res = fix_odoo_addon(str(addon), fix_types=["security"], dry_run=False)
+    assert res["success"] is True
+
+    csv_content = csv_file.read_text(encoding="utf-8")
+    assert "model_custom_order" in csv_content
+
+
+def test_fix_odoo_addon_python_model(tmp_path: Path):
+    addon = tmp_path / "py_addon"
+    _create_full_valid_addon(addon)
+
+    py_file = addon / "models" / "order.py"
+    py_code = (
+        "from odoo import models, fields, api\n\n"
+        "class CustomOrder(models.Model):\n"
+        "    _name = 'custom.order'\n"
+        "    _description = 'Custom Order'\n\n"
+        "    @api.multi\n"
+        "    def do_work(self):\n"
+        "        pass\n\n"
+        "    def create(self, vals):\n"
+        "        return super().create(vals)\n"
+    )
+    py_file.write_text(py_code, encoding="utf-8")
+
+    res = fix_odoo_addon(str(addon), fix_types=["models"], dry_run=False)
+    assert res["success"] is True
+
+    new_code = py_file.read_text(encoding="utf-8")
+    assert "@api.multi" not in new_code
+    assert "@api.model_create_multi\n    def create(self, vals):" in new_code
+
+
+def test_fix_odoo_addon_xml_views(tmp_path: Path):
+    addon = tmp_path / "view_addon"
+    _create_full_valid_addon(addon)
+
+    view_file = addon / "views" / "order_views.xml"
+    view_content = (
+        "<odoo>\n"
+        "  <record id=' view_order_tree ' model='ir.ui.view'>\n"
+        "    <field name='name'>order.tree</field>\n"
+        "    <field name='arch' type='xml'>\n"
+        "      <tree string='Orders'>\n"
+        "        <field name='name' attrs=\"{'invisible': [('state', '=', 'done')]}\"/>\n"
+        "      </tree>\n"
+        "    </field>\n"
+        "  </record>\n"
+        "</odoo>"
+    )
+    view_file.write_text(view_content, encoding="utf-8")
+
+    res = fix_odoo_addon(str(addon), fix_types=["views"], dry_run=False)
+    assert res["success"] is True
+
+    new_content = view_file.read_text(encoding="utf-8")
+    assert "<list string='Orders'>" in new_content
+    assert "</list>" in new_content
+    assert "attrs=" not in new_content
+    assert 'invisible="state == \'done\'"' in new_content
+    assert "id='view_order_tree'" in new_content
+
+
+def test_fix_odoo_addon_apply_creates_backup(tmp_path: Path):
+    addon = tmp_path / "backup_addon"
+    _create_full_valid_addon(addon)
+
+    py_file = addon / "models" / "order.py"
+    py_file.write_text(
+        "from odoo import models, api\n\n"
+        "class M(models.Model):\n"
+        "    _name = 'test.m'\n"
+        "    @api.multi\n"
+        "    def foo(self): pass\n",
+        encoding="utf-8",
+    )
+
+    res = fix_odoo_addon(str(addon), dry_run=False)
+    assert res["success"] is True
+    assert res["backup_path"] is not None
+    backup_path = Path(res["backup_path"])
+    assert backup_path.exists()
+    assert (backup_path / "models" / "order.py").exists()
+
+
+def test_cli_fix_command(tmp_path: Path, capsys):
+    addon = tmp_path / "cli_addon"
+    _create_full_valid_addon(addon)
+
+    py_file = addon / "models" / "order.py"
+    py_file.write_text(
+        "from odoo import models, api\n\n"
+        "class M(models.Model):\n"
+        "    _name = 'test.m'\n"
+        "    @api.multi\n"
+        "    def foo(self): pass\n",
+        encoding="utf-8",
+    )
+
+    # CLI fix dry run
+    code = cli_fix(str(addon), apply=False)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[PERMISSION REQUIRED (DRY RUN)]" in out
+    assert "@api.multi" in py_file.read_text(encoding="utf-8")
+
+    # CLI fix apply
+    code = cli_fix(str(addon), apply=True)
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "[APPLIED CHANGES]" in out
+    assert "@api.multi" not in py_file.read_text(encoding="utf-8")
+
+    # CLI main subcommands
+    code_sub = cli_main(["fix", str(addon)])
+    assert code_sub == 0
+
+    code_check_fix = cli_main(["check", str(addon), "--fix", "--apply"])
+    assert code_check_fix == 0

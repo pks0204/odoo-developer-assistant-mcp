@@ -4428,6 +4428,469 @@ def scaffold_odoo_tests(
     }
 
 
+def _fix_owl_file(file_path: Path, content: str) -> tuple[str, list[dict]]:
+    """Fix OWL / frontend JavaScript and QWeb XML files."""
+    fixes = []
+    new_content = content
+    ext = file_path.suffix.lower()
+
+    if ext == ".js":
+        if "/** @odoo-module **/" not in content and "@odoo-module" not in content:
+            if "import " in content or "export " in content or "Component" in content:
+                new_content = "/** @odoo-module **/\n" + content.lstrip()
+                fixes.append({
+                    "file": file_path.name,
+                    "issue_type": "MISSING_ODOO_MODULE_HEADER",
+                    "description": "Added '/** @odoo-module **/' header to top of ES module file.",
+                })
+
+    elif ext == ".xml":
+        if "t-raw=" in content:
+            new_content = re.sub(r'\bt-raw=(["\'])', r't-out=\1', content)
+            if new_content != content:
+                fixes.append({
+                    "file": file_path.name,
+                    "issue_type": "OBSOLETE_T_RAW",
+                    "description": "Replaced security-deprecated 't-raw' with 't-out'.",
+                })
+
+    return new_content, fixes
+
+
+def _fix_security_csv_file(file_path: Path, content: str) -> tuple[str, list[dict]]:
+    """Fix ir.model.access.csv model ID prefixes and whitespace."""
+    fixes = []
+    lines = content.splitlines()
+    if not lines:
+        return content, fixes
+
+    reader = csv.reader(lines)
+    rows = list(reader)
+    if not rows:
+        return content, fixes
+
+    header = [h.strip() for h in rows[0]]
+    if "model_id:id" not in header:
+        return content, fixes
+
+    model_idx = header.index("model_id:id")
+    new_rows = [[h.strip() for h in rows[0]]]
+    modified = False
+
+    for row_idx, row in enumerate(rows[1:], start=2):
+        if not row or not any(row):
+            continue
+        cleaned_row = [c.strip() for c in row]
+        if len(cleaned_row) > model_idx:
+            m_val = cleaned_row[model_idx]
+            if m_val and not m_val.startswith("model_"):
+                new_m_val = "model_" + m_val.replace(".", "_")
+                cleaned_row[model_idx] = new_m_val
+                modified = True
+                fixes.append({
+                    "file": file_path.name,
+                    "line": row_idx,
+                    "issue_type": "MISSING_MODEL_PREFIX",
+                    "description": f"Prepend 'model_' prefix to model identifier: '{m_val}' -> '{new_m_val}'.",
+                })
+        new_rows.append(cleaned_row)
+
+    if not modified and lines == [",".join(r) for r in new_rows]:
+        return content, fixes
+
+    output = io.StringIO()
+    writer = csv.writer(output, lineterminator="\n")
+    writer.writerows(new_rows)
+    return output.getvalue(), fixes
+
+
+def _fix_python_model_file(file_path: Path, content: str) -> tuple[str, list[dict]]:
+    """Fix obsolete decorators and missing @api.model_create_multi in Python models."""
+    fixes = []
+    new_content = content
+
+    # 1. Remove @api.multi and @api.one decorators
+    multi_pattern = re.compile(r'^[ \t]*@api\.(?:multi|one)\b[^\n]*\n?', re.MULTILINE)
+    matches = list(multi_pattern.finditer(new_content))
+    if matches:
+        new_content = multi_pattern.sub('', new_content)
+        fixes.append({
+            "file": file_path.name,
+            "issue_type": "OBSOLETE_DECORATOR",
+            "description": f"Removed {len(matches)} obsolete @api.multi / @api.one decorator(s).",
+        })
+
+    # 2. Add @api.model_create_multi above def create(self, ...) if missing
+    try:
+        tree = ast.parse(new_content, filename=str(file_path))
+        lines = new_content.splitlines(keepends=True)
+        inject_indices = []
+
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not _is_odoo_model_class(node):
+                continue
+            for stmt in node.body:
+                if isinstance(stmt, ast.FunctionDef) and stmt.name == "create":
+                    has_multi = False
+                    for dec in stmt.decorator_list:
+                        if isinstance(dec, ast.Attribute) and dec.attr == "model_create_multi":
+                            has_multi = True
+                        elif isinstance(dec, ast.Name) and dec.id == "model_create_multi":
+                            has_multi = True
+                        elif isinstance(dec, ast.Call):
+                            if isinstance(dec.func, ast.Attribute) and dec.func.attr == "model_create_multi":
+                                has_multi = True
+                            elif isinstance(dec.func, ast.Name) and dec.func.id == "model_create_multi":
+                                has_multi = True
+                    if not has_multi:
+                        line_idx = stmt.lineno - 1
+                        indent = " " * stmt.col_offset
+                        inject_indices.append((line_idx, f"{indent}@api.model_create_multi\n"))
+
+        if inject_indices:
+            for line_idx, dec_line in sorted(inject_indices, key=lambda x: x[0], reverse=True):
+                lines.insert(line_idx, dec_line)
+            new_content = "".join(lines)
+            fixes.append({
+                "file": file_path.name,
+                "issue_type": "CREATE_MISSING_MODEL_CREATE_MULTI",
+                "description": "Injected @api.model_create_multi decorator above create() override(s).",
+            })
+    except Exception:
+        pass
+
+    # 3. Replace fields.Date.to_string(d) / fields.Datetime.to_string(dt)
+    dt_pattern = re.compile(r'\bfields\.(?:Date|Datetime)\.to_string\(([^)]+)\)')
+    if dt_pattern.search(new_content):
+        new_content = dt_pattern.sub(r'str(\1)', new_content)
+        fixes.append({
+            "file": file_path.name,
+            "issue_type": "DEPRECATED_DATETIME_CONVERSION",
+            "description": "Replaced fields.Date/Datetime.to_string() with native Python str().",
+        })
+
+    return new_content, fixes
+
+
+def _fix_xml_view_file(file_path: Path, content: str) -> tuple[str, list[dict]]:
+    """Fix XML view deprecated <tree> tags, attrs, states, and record ID whitespace."""
+    fixes = []
+    new_content = content
+
+    # 1. Convert <tree> to <list>
+    new_content, t_open_c = TREE_OPEN_PATTERN.subn(r'<list\1', new_content)
+    new_content, t_close_c = TREE_CLOSE_PATTERN.subn(r'</list>', new_content)
+    count_tree = t_open_c + t_close_c
+    if count_tree > 0:
+        fixes.append({
+            "file": file_path.name,
+            "issue_type": "DEPRECATED_TREE_TAG",
+            "description": f"Converted {count_tree} deprecated <tree> tag(s) to modern <list> tags.",
+        })
+
+    # 2. Convert attrs="{...}"
+    def replace_attrs(match):
+        raw_dict_str = match.group(2)
+        try:
+            attrs_dict = ast.literal_eval(raw_dict_str)
+            if not isinstance(attrs_dict, dict):
+                return match.group(0)
+        except Exception:
+            return match.group(0)
+
+        replacements = []
+        for attr_name in ("invisible", "readonly", "required"):
+            if attr_name in attrs_dict:
+                domain = attrs_dict[attr_name]
+                expr = _eval_domain_ast(domain)
+                if expr:
+                    replacements.append(f'{attr_name}="{expr}"')
+        return " ".join(replacements) if replacements else match.group(0)
+
+    new_content, count_attrs = ATTRS_PATTERN.subn(replace_attrs, new_content)
+    if count_attrs > 0:
+        fixes.append({
+            "file": file_path.name,
+            "issue_type": "LEGACY_ATTRS",
+            "description": f"Converted {count_attrs} legacy attrs attributes to direct boolean expressions.",
+        })
+
+    # 3. Convert states="..."
+    def replace_states(match):
+        raw_states = match.group(2)
+        vals = [s.strip() for s in raw_states.split(",") if s.strip()]
+        if not vals:
+            return match.group(0)
+        if len(vals) == 1:
+            return f'invisible="state != \'{vals[0]}\'"'
+        tuple_str = f"({', '.join(repr(v) for v in vals)})"
+        return f'invisible="state not in {tuple_str}"'
+
+    new_content, count_states = STATES_PATTERN.subn(replace_states, new_content)
+    if count_states > 0:
+        fixes.append({
+            "file": file_path.name,
+            "issue_type": "LEGACY_STATES",
+            "description": f"Converted {count_states} legacy states attributes to direct invisible expressions.",
+        })
+
+    # 4. Strip whitespace in record ID
+    ws_id_pattern = re.compile(r'<record\s+id=([\'"])\s+([^\'"]+?)\s*\1|<record\s+id=([\'"])([^\'"]+?)\s+\1')
+    if ws_id_pattern.search(new_content):
+        new_content = re.sub(r'<record\s+id=([\'"])\s*([^\'"]+?)\s*\1', r'<record id=\1\2\1', new_content)
+        fixes.append({
+            "file": file_path.name,
+            "issue_type": "ID_HAS_WHITESPACE",
+            "description": "Stripped leading/trailing whitespace from <record id='...'>.",
+        })
+
+    # 5. Convert t-raw to t-out
+    if "t-raw" in new_content:
+        new_content, count_t_raw = re.subn(r'\bt-raw=', 't-out=', new_content)
+        if count_t_raw > 0:
+            fixes.append({
+                "file": file_path.name,
+                "issue_type": "DEPRECATED_QWEB_T_RAW",
+                "description": f"Replaced {count_t_raw} legacy t-raw attribute(s) with modern t-out.",
+            })
+
+    return new_content, fixes
+
+
+@mcp.tool()
+def fix_odoo_addon(
+    addon_path: str,
+    fix_types: list[str] | None = None,
+    dry_run: bool = True,
+) -> dict:
+    """Automatically detect and fix common Odoo issues across frontend OWL/JS, XML views,
+    Python models, and security CSV files.
+
+    Strictly gated by permission: defaults to dry_run=True (preview unified diffs only).
+    When dry_run=False, saves a timestamped backup before writing any changes to disk.
+
+    Args:
+        addon_path: Path to the Odoo addon directory.
+        fix_types: Optional list of domains to fix ('views', 'models', 'security', 'owl').
+            Defaults to all domains if None.
+        dry_run: If True, previews proposed changes without modifying files on disk.
+            If False, explicitly applies fixes after saving a full backup.
+    """
+    if not isinstance(addon_path, str) or not addon_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide an addon directory path as text.",
+        }
+
+    try:
+        resolved_addon = Path(addon_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid addon path: {exc}",
+        }
+
+    if not resolved_addon.exists():
+        return {
+            "success": False,
+            "error": f"Addon directory does not exist: {resolved_addon}",
+        }
+
+    if not resolved_addon.is_dir():
+        return {
+            "success": False,
+            "error": f"Provided path is a file, not a directory: {resolved_addon}",
+        }
+
+    manifest_path = resolved_addon / "__manifest__.py"
+    if not manifest_path.is_file():
+        return {
+            "success": False,
+            "error": f"No __manifest__.py found in addon directory: {resolved_addon}",
+        }
+
+    target_types = set(fix_types) if fix_types else {"views", "models", "security", "owl"}
+    modified_files = []
+    files_to_write = {}
+    all_fixes = []
+    fixes_by_type = {}
+    files_scanned = 0
+
+    # 1. Views
+    if "views" in target_types:
+        for xml_file in sorted(resolved_addon.glob("**/*.xml")):
+            if (
+                xml_file.name.startswith(".")
+                or "static" in xml_file.parts
+                or "_migration_backups" in xml_file.parts
+                or "_code_fix_backups" in xml_file.parts
+            ):
+                continue
+            files_scanned += 1
+            try:
+                content = xml_file.read_text(encoding="utf-8")
+                new_content, f_list = _fix_xml_view_file(xml_file, content)
+                if new_content != content:
+                    files_to_write[xml_file] = new_content
+                    all_fixes.extend(f_list)
+                    for f in f_list:
+                        fixes_by_type[f["issue_type"]] = fixes_by_type.get(f["issue_type"], 0) + 1
+                    rel = str(xml_file.relative_to(resolved_addon))
+                    diff_lines = list(difflib.unified_diff(
+                        content.splitlines(keepends=True),
+                        new_content.splitlines(keepends=True),
+                        fromfile=f"a/{rel}",
+                        tofile=f"b/{rel}",
+                    ))
+                    modified_files.append({
+                        "file": rel,
+                        "domain": "views",
+                        "fixes": f_list,
+                        "diff": "".join(diff_lines),
+                    })
+            except Exception:
+                continue
+
+    # 2. Python Models
+    if "models" in target_types:
+        for py_file in sorted(resolved_addon.glob("**/*.py")):
+            if (
+                py_file.name.startswith(".")
+                or py_file.name in ("__manifest__.py", "__init__.py")
+                or "tests" in py_file.parts
+                or "migrations" in py_file.parts
+                or "_migration_backups" in py_file.parts
+                or "_code_fix_backups" in py_file.parts
+            ):
+                continue
+            files_scanned += 1
+            try:
+                content = py_file.read_text(encoding="utf-8")
+                new_content, f_list = _fix_python_model_file(py_file, content)
+                if new_content != content:
+                    files_to_write[py_file] = new_content
+                    all_fixes.extend(f_list)
+                    for f in f_list:
+                        fixes_by_type[f["issue_type"]] = fixes_by_type.get(f["issue_type"], 0) + 1
+                    rel = str(py_file.relative_to(resolved_addon))
+                    diff_lines = list(difflib.unified_diff(
+                        content.splitlines(keepends=True),
+                        new_content.splitlines(keepends=True),
+                        fromfile=f"a/{rel}",
+                        tofile=f"b/{rel}",
+                    ))
+                    modified_files.append({
+                        "file": rel,
+                        "domain": "models",
+                        "fixes": f_list,
+                        "diff": "".join(diff_lines),
+                    })
+            except Exception:
+                continue
+
+    # 3. Security CSV
+    if "security" in target_types:
+        sec_csv = resolved_addon / "security" / "ir.model.access.csv"
+        if sec_csv.is_file():
+            files_scanned += 1
+            try:
+                content = sec_csv.read_text(encoding="utf-8")
+                new_content, f_list = _fix_security_csv_file(sec_csv, content)
+                if new_content != content:
+                    files_to_write[sec_csv] = new_content
+                    all_fixes.extend(f_list)
+                    for f in f_list:
+                        fixes_by_type[f["issue_type"]] = fixes_by_type.get(f["issue_type"], 0) + 1
+                    rel = str(sec_csv.relative_to(resolved_addon))
+                    diff_lines = list(difflib.unified_diff(
+                        content.splitlines(keepends=True),
+                        new_content.splitlines(keepends=True),
+                        fromfile=f"a/{rel}",
+                        tofile=f"b/{rel}",
+                    ))
+                    modified_files.append({
+                        "file": rel,
+                        "domain": "security",
+                        "fixes": f_list,
+                        "diff": "".join(diff_lines),
+                    })
+            except Exception:
+                pass
+
+    # 4. OWL / JS & QWeb
+    if "owl" in target_types:
+        for f_path in sorted(list(resolved_addon.glob("static/src/**/*.js")) + list(resolved_addon.glob("static/src/**/*.xml"))):
+            files_scanned += 1
+            try:
+                content = f_path.read_text(encoding="utf-8")
+                new_content, f_list = _fix_owl_file(f_path, content)
+                if new_content != content:
+                    files_to_write[f_path] = new_content
+                    all_fixes.extend(f_list)
+                    for f in f_list:
+                        fixes_by_type[f["issue_type"]] = fixes_by_type.get(f["issue_type"], 0) + 1
+                    rel = str(f_path.relative_to(resolved_addon))
+                    diff_lines = list(difflib.unified_diff(
+                        content.splitlines(keepends=True),
+                        new_content.splitlines(keepends=True),
+                        fromfile=f"a/{rel}",
+                        tofile=f"b/{rel}",
+                    ))
+                    modified_files.append({
+                        "file": rel,
+                        "domain": "owl",
+                        "fixes": f_list,
+                        "diff": "".join(diff_lines),
+                    })
+            except Exception:
+                continue
+
+    backup_path = None
+    if not dry_run and files_to_write:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_dir = resolved_addon / "_code_fix_backups" / timestamp
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup_path = str(backup_dir)
+
+        for target_file, new_text in files_to_write.items():
+            rel = target_file.relative_to(resolved_addon)
+            dest_backup = backup_dir / rel
+            dest_backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(target_file, dest_backup)
+            target_file.write_text(new_text, encoding="utf-8")
+
+    suggestions = []
+    if dry_run:
+        if modified_files:
+            suggestions.append(
+                f"Dry run complete: Found {len(all_fixes)} fixable issue(s) across {len(modified_files)} file(s). "
+                "Permission required: To apply these fixes to disk, re-run with dry_run=False (or CLI --apply)."
+            )
+        else:
+            suggestions.append("No fixable code issues detected across scanned files.")
+    else:
+        suggestions.append(
+            f"Successfully applied {len(all_fixes)} fix(es) across {len(modified_files)} file(s). "
+            f"Full backup saved to '{backup_path}'."
+        )
+
+    return {
+        "success": True,
+        "addon_name": resolved_addon.name,
+        "addon_path": str(resolved_addon),
+        "dry_run": dry_run,
+        "backup_path": backup_path,
+        "summary": {
+            "files_scanned": files_scanned,
+            "files_modified": len(modified_files),
+            "total_fixes": len(all_fixes),
+            "fixes_by_type": fixes_by_type,
+        },
+        "modified_files": modified_files,
+        "suggestions": suggestions,
+    }
+
+
 def format_cli_report(result: dict, title: str) -> str:
     """Format structured analyzer output into human-readable terminal report."""
     lines = [
@@ -4488,8 +4951,17 @@ def format_cli_report(result: dict, title: str) -> str:
     return "\n".join(lines)
 
 
-def cli_check(path_str: str, fail_on_warning: bool = False, addons_dirs: list[str] | None = None) -> int:
+def cli_check(
+    path_str: str,
+    fail_on_warning: bool = False,
+    addons_dirs: list[str] | None = None,
+    fix: bool = False,
+    apply: bool = False,
+) -> int:
     """Run static check on an addon directory or individual file."""
+    if fix:
+        return cli_fix(path_str, apply=apply)
+
     try:
         target = Path(path_str).expanduser().resolve()
     except Exception as exc:
@@ -4729,6 +5201,52 @@ exit 0
         return 2
 
 
+def cli_fix(addon_path: str, apply: bool = False, fix_types: list[str] | None = None) -> int:
+    """Run automated code fixer via CLI."""
+    res = fix_odoo_addon(addon_path, fix_types=fix_types, dry_run=not apply)
+    if not res.get("success"):
+        print(f"[ERROR] {res.get('error', 'Auto-fix failed')}", file=sys.stderr)
+        return 2
+
+    print("=" * 80)
+    mode_str = "APPLIED CHANGES" if apply else "PERMISSION REQUIRED (DRY RUN)"
+    print(f" Odoo Developer Assistant: Automated Code Fixer [{mode_str}]")
+    print("=" * 80)
+    print(f"Addon: {res.get('addon_name')}")
+    print(f"Path: {res.get('addon_path')}")
+    if res.get("backup_path"):
+        print(f"Backup saved to: {res.get('backup_path')}")
+
+    summary = res.get("summary", {})
+    if summary:
+        print("\nSummary:")
+        for k, v in summary.items():
+            if isinstance(v, dict):
+                print(f"  - {k.replace('_', ' ').capitalize()}:")
+                for sub_k, sub_v in v.items():
+                    print(f"      * {sub_k}: {sub_v}")
+            else:
+                print(f"  - {k.replace('_', ' ').capitalize()}: {v}")
+
+    modified_files = res.get("modified_files", [])
+    if modified_files:
+        print(f"\nProposed / Applied Fixes ({len(modified_files)} file(s)):")
+        for mf in modified_files:
+            print(f"\n--- {mf['file']} ({mf['domain']}, {len(mf['fixes'])} fix(es)) ---")
+            for fx in mf["fixes"]:
+                print(f"  [FIX] {fx['issue_type']}: {fx['description']}")
+            if "diff" in mf and mf["diff"]:
+                print(mf["diff"])
+
+    suggestions = res.get("suggestions", [])
+    if suggestions:
+        print("\nSuggestions:")
+        for s in suggestions:
+            print(f"  * {s}")
+    print("=" * 80)
+    return 0
+
+
 def cli_main(args: list[str] | None = None) -> int:
     """Main CLI command line entry dispatcher."""
     if args is None:
@@ -4744,6 +5262,13 @@ def cli_main(args: list[str] | None = None) -> int:
     check_p.add_argument("path", help="Path to addon directory or file (.xml, .py, .csv, .js)")
     check_p.add_argument("--fail-on-warning", action="store_true", help="Exit with code 1 if warnings are found.")
     check_p.add_argument("--addons-dir", action="append", dest="addons_dirs", help="Additional addons directory for dependency checks.")
+    check_p.add_argument("--fix", action="store_true", help="Detect and automatically fix common Odoo issues.")
+    check_p.add_argument("--apply", action="store_true", help="Explicitly give permission to write fixes to disk.")
+
+    fix_p = subparsers.add_parser("fix", help="Detect and automatically fix common Odoo issues with permission.")
+    fix_p.add_argument("addon_path", help="Path to addon directory")
+    fix_p.add_argument("--apply", action="store_true", help="Explicitly give permission to apply fixes to disk (creates backup).")
+    fix_p.add_argument("--domain", action="append", dest="fix_types", choices=["views", "models", "security", "owl"], help="Restrict fixes to specific domains.")
 
     migrate_p = subparsers.add_parser("migrate", help="Migrate an addon to Odoo 19.")
     migrate_p.add_argument("addon_path", help="Path to addon directory")
@@ -4768,7 +5293,15 @@ def cli_main(args: list[str] | None = None) -> int:
         return 0
 
     if parsed.command == "check":
-        return cli_check(parsed.path, fail_on_warning=parsed.fail_on_warning, addons_dirs=parsed.addons_dirs)
+        return cli_check(
+            parsed.path,
+            fail_on_warning=parsed.fail_on_warning,
+            addons_dirs=parsed.addons_dirs,
+            fix=parsed.fix,
+            apply=parsed.apply,
+        )
+    elif parsed.command == "fix":
+        return cli_fix(parsed.addon_path, apply=parsed.apply, fix_types=parsed.fix_types)
     elif parsed.command == "migrate":
         return cli_migrate(parsed.addon_path, target_version=parsed.target_version, apply=parsed.apply)
     elif parsed.command == "scaffold-tests":
@@ -4786,7 +5319,7 @@ def main(argv: list[str] | None = None) -> None:
         mcp.run()
         return
 
-    cli_subcommands = {"check", "migrate", "scaffold-tests", "install-hook", "-h", "--help"}
+    cli_subcommands = {"check", "fix", "migrate", "scaffold-tests", "install-hook", "-h", "--help"}
     if args and (args[0] in cli_subcommands):
         sys.exit(cli_main(args))
 
