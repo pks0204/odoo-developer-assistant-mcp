@@ -1941,3 +1941,153 @@ def test_migrate_addon_scaffolds_openupgrade_files(tmp_path: Path):
     pre_file.write_text("# Custom migration logic here\n", encoding="utf-8")
     result_second = migrate_odoo_addon(str(addon), target_version="19.0", dry_run=False, scaffold_openupgrade=True)
     assert pre_file.read_text(encoding="utf-8") == "# Custom migration logic here\n"
+
+
+def test_migrate_addon_detects_name_get_and_suggests_compute_display_name(tmp_path: Path):
+    addon = tmp_path / "name_get_addon"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'NameGet', 'version': '16.0.1.0'}", encoding="utf-8")
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    py_file = models_dir / "custom_model.py"
+    py_file.write_text(
+        "from odoo import models, fields\n\n"
+        "class CustomOrder(models.Model):\n"
+        "    _name = 'custom.order'\n"
+        "    name = fields.Char('Name')\n\n"
+        "    def name_get(self):\n"
+        "        result = []\n"
+        "        for rec in self:\n"
+        "            result.append((rec.id, f'{rec.name}'))\n"
+        "        return result\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=True, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["python_files_scanned"] == 1
+    assert result["summary"]["name_get_count"] == 1
+    assert any("name_get" in s for s in result["suggestions"])
+
+    # Check python_audit details
+    name_get_issue = next(i for i in result["python_audit"] if i["issue_type"] == "NAME_GET_DEPRECATED")
+    assert name_get_issue["class_name"] == "CustomOrder"
+    assert name_get_issue["method_name"] == "name_get"
+    assert "_compute_display_name" in name_get_issue["suggested_fix"]
+
+
+def test_migrate_addon_detects_create_missing_model_create_multi(tmp_path: Path):
+    addon = tmp_path / "create_addon"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'CreateTest', 'version': '17.0.1.0'}", encoding="utf-8")
+    py_file = addon / "models.py"
+    py_file.write_text(
+        "from odoo import models, fields, api\n\n"
+        "class SingleCreate(models.Model):\n"
+        "    _name = 'single.create'\n\n"
+        "    def create(self, vals):\n"
+        "        return super().create(vals)\n\n"
+        "class MultiCreate(models.Model):\n"
+        "    _name = 'multi.create'\n\n"
+        "    @api.model_create_multi\n"
+        "    def create(self, vals_list):\n"
+        "        return super().create(vals_list)\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=True, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["create_without_multi_count"] == 1
+    assert any("missing @api.model_create_multi" in s for s in result["suggestions"])
+
+    create_issue = next(i for i in result["python_audit"] if i["issue_type"] == "CREATE_MISSING_MODEL_CREATE_MULTI")
+    assert create_issue["class_name"] == "SingleCreate"
+    assert "vals_list" in create_issue["suggested_fix"]
+
+
+def test_migrate_addon_detects_deprecated_orm_calls(tmp_path: Path):
+    addon = tmp_path / "deprecated_calls_addon"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'DepCalls', 'version': '16.0.1.0'}", encoding="utf-8")
+    py_file = addon / "service.py"
+    py_file.write_text(
+        "from odoo import models, fields, api\n\n"
+        "class LegacyService(models.Model):\n"
+        "    _name = 'legacy.service'\n\n"
+        "    @api.multi\n"
+        "    def action_sync(self):\n"
+        "        today_str = fields.Date.to_string(fields.Date.today())\n"
+        "        self.env.cr.commit()\n"
+        "        return today_str\n\n"
+        "    def _name_search(self, name='', args=None, operator='ilike', limit=100, name_get_uid=None):\n"
+        "        return super()._name_search(name, args, operator, limit, name_get_uid)\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=True, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["deprecated_orm_calls_count"] == 4
+
+    issue_types = {i["issue_type"] for i in result["python_audit"]}
+    assert "OBSOLETE_DECORATOR" in issue_types
+    assert "DEPRECATED_DATETIME_CONVERSION" in issue_types
+    assert "MANUAL_TRANSACTION_COMMIT" in issue_types
+    assert "NAME_SEARCH_LEGACY_SIGNATURE" in issue_types
+
+
+def test_migrate_addon_enterprise_dependency_detection(tmp_path: Path):
+    addon = tmp_path / "enterprise_addon"
+    addon.mkdir()
+    manifest_file = addon / "__manifest__.py"
+    manifest_file.write_text(
+        "{\n"
+        "    'name': 'Enterprise Feature',\n"
+        "    'version': '16.0.1.0.0',\n"
+        "    'depends': ['sale_management', 'account_reports', 'helpdesk', 'web_studio'],\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=True, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["edition_requirement"] == "Enterprise"
+    assert result["enterprise_audit"]["edition_requirement"] == "Enterprise"
+    assert "account_reports" in result["enterprise_audit"]["enterprise_dependencies"]
+    assert "helpdesk" in result["enterprise_audit"]["enterprise_dependencies"]
+    assert result["enterprise_audit"]["has_studio_customizations"] is True
+    assert any("Edition requirement: Enterprise" in s for s in result["suggestions"])
+
+
+def test_migrate_addon_community_dependency_detection(tmp_path: Path):
+    addon = tmp_path / "community_addon"
+    addon.mkdir()
+    manifest_file = addon / "__manifest__.py"
+    manifest_file.write_text(
+        "{\n"
+        "    'name': 'Community Module',\n"
+        "    'version': '17.0.1.0.0',\n"
+        "    'depends': ['base', 'sale', 'stock', 'account'],\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    result = migrate_odoo_addon(str(addon), dry_run=True, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["edition_requirement"] == "Community"
+    assert result["enterprise_audit"]["edition_requirement"] == "Community"
+    assert result["enterprise_audit"]["enterprise_dependencies"] == []
+    assert result["enterprise_audit"]["has_studio_customizations"] is False
+    assert any("compatible with Odoo 19 Community Edition" in note for note in result["enterprise_audit"]["notes"])
+
+
+def test_migrate_addon_handles_python_syntax_error_gracefully(tmp_path: Path):
+    addon = tmp_path / "broken_python_addon"
+    addon.mkdir()
+    (addon / "__manifest__.py").write_text("{'name': 'Broken', 'version': '16.0.1.0'}", encoding="utf-8")
+    (addon / "broken.py").write_text("def invalid_syntax(\n", encoding="utf-8")
+
+    result = migrate_odoo_addon(str(addon), dry_run=True, scaffold_openupgrade=False)
+    assert result["success"] is True
+    assert result["summary"]["python_files_scanned"] == 1
+    syntax_issue = next(i for i in result["python_audit"] if i["issue_type"] == "PYTHON_SYNTAX_ERROR")
+    assert "Failed to parse Python syntax" in syntax_issue["message"]

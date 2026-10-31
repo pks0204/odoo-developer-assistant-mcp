@@ -2611,6 +2611,205 @@ odoo-bin -c odoo.conf -u {addon_name} -d <database_name> --stop-after-init
 '''
 
 
+KNOWN_ENTERPRISE_MODULES = {
+    "account_accountant",
+    "account_asset",
+    "account_budget",
+    "account_consolidation",
+    "account_reports",
+    "appointment",
+    "approvals",
+    "data_recycle",
+    "documents",
+    "documents_hr",
+    "helpdesk",
+    "industry_fsm",
+    "industry_fsm_report",
+    "knowledge",
+    "marketing_automation",
+    "mrp_mps",
+    "mrp_subcontracting_account",
+    "mrp_workorder",
+    "planning",
+    "quality_control",
+    "quality_mrp",
+    "sale_renting",
+    "sale_subscription",
+    "sign",
+    "social",
+    "timesheet_grid",
+    "voip",
+    "web_cohort",
+    "web_gantt",
+    "web_grid",
+    "web_map",
+    "web_studio",
+}
+
+
+def _audit_python_migration_file(file_path: Path, rel_path: str) -> list[dict]:
+    """Inspect a Python file for Odoo 16/17/18 -> 19 migration deprecations and patterns."""
+    issues = []
+    try:
+        content = file_path.read_text(encoding="utf-8")
+        tree = ast.parse(content, filename=str(file_path))
+    except Exception as exc:
+        return [
+            {
+                "file": rel_path,
+                "line": 1,
+                "class_name": None,
+                "method_name": None,
+                "issue_type": "PYTHON_SYNTAX_ERROR",
+                "message": f"Failed to parse Python syntax: {exc}",
+                "suggested_fix": "Fix Python syntax error.",
+            }
+        ]
+
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+
+        is_model = _is_odoo_model_class(node)
+        class_name = node.name
+
+        for stmt in node.body:
+            if isinstance(stmt, ast.FunctionDef):
+                method_name = stmt.name
+
+                # Check decorators on this method
+                has_model_create_multi = False
+                for dec in stmt.decorator_list:
+                    dec_name = None
+                    if isinstance(dec, ast.Attribute) and isinstance(dec.value, ast.Name) and dec.value.id == "api":
+                        dec_name = dec.attr
+                    elif isinstance(dec, ast.Name):
+                        dec_name = dec.id
+                    elif isinstance(dec, ast.Call):
+                        if (
+                            isinstance(dec.func, ast.Attribute)
+                            and isinstance(dec.func.value, ast.Name)
+                            and dec.func.value.id == "api"
+                        ):
+                            dec_name = dec.func.attr
+                        elif isinstance(dec.func, ast.Name):
+                            dec_name = dec.func.id
+
+                    if dec_name == "model_create_multi":
+                        has_model_create_multi = True
+                    elif dec_name in ("multi", "one", "returns"):
+                        issues.append({
+                            "file": rel_path,
+                            "line": dec.lineno if hasattr(dec, "lineno") else stmt.lineno,
+                            "class_name": class_name,
+                            "method_name": method_name,
+                            "issue_type": "OBSOLETE_DECORATOR",
+                            "message": f"Legacy decorator @api.{dec_name} is obsolete and removed in modern Odoo.",
+                            "suggested_fix": f"Remove @api.{dec_name} decorator.",
+                        })
+
+                # 1. Check name_get
+                if is_model and method_name == "name_get":
+                    issues.append({
+                        "file": rel_path,
+                        "line": stmt.lineno,
+                        "class_name": class_name,
+                        "method_name": "name_get",
+                        "issue_type": "NAME_GET_DEPRECATED",
+                        "message": (
+                            "name_get() was deprecated in Odoo 17 and removed. "
+                            "In Odoo 18/19, display_name is a computed field. Implement _compute_display_name() instead."
+                        ),
+                        "suggested_fix": (
+                            "def _compute_display_name(self):\n"
+                            "    for record in self:\n"
+                            "        record.display_name = f\"{record.name}\""
+                        ),
+                    })
+
+                # 2. Check create override
+                if is_model and method_name == "create":
+                    if not has_model_create_multi:
+                        issues.append({
+                            "file": rel_path,
+                            "line": stmt.lineno,
+                            "class_name": class_name,
+                            "method_name": "create",
+                            "issue_type": "CREATE_MISSING_MODEL_CREATE_MULTI",
+                            "message": (
+                                "create() override does not use @api.model_create_multi. "
+                                "In Odoo 17/18/19, create() must accept vals_list for high-performance batch creation."
+                            ),
+                            "suggested_fix": (
+                                "@api.model_create_multi\n"
+                                "def create(self, vals_list):\n"
+                                "    return super().create(vals_list)"
+                            ),
+                        })
+
+                # 3. Check _name_search legacy signature
+                if is_model and method_name == "_name_search":
+                    arg_names = [arg.arg for arg in stmt.args.args]
+                    if "name_get_uid" in arg_names:
+                        issues.append({
+                            "file": rel_path,
+                            "line": stmt.lineno,
+                            "class_name": class_name,
+                            "method_name": "_name_search",
+                            "issue_type": "NAME_SEARCH_LEGACY_SIGNATURE",
+                            "message": (
+                                "_name_search() signature with 'name_get_uid' is obsolete in Odoo 17/18/19."
+                            ),
+                            "suggested_fix": (
+                                "Update signature to: def _name_search(self, name='', domain=None, operator='ilike', limit=None, order=None):"
+                            ),
+                        })
+
+    # Traverse all call expressions across the AST for deprecated ORM calls and manual commits
+    for subnode in ast.walk(tree):
+        if isinstance(subnode, ast.Call):
+            func = subnode.func
+            # Check fields.Date.to_string, etc.
+            if isinstance(func, ast.Attribute) and func.attr in ("to_string", "from_string"):
+                if isinstance(func.value, ast.Attribute) and isinstance(func.value.value, ast.Name):
+                    if func.value.value.id == "fields" and func.value.attr in ("Date", "Datetime"):
+                        issues.append({
+                            "file": rel_path,
+                            "line": subnode.lineno,
+                            "class_name": None,
+                            "method_name": None,
+                            "issue_type": "DEPRECATED_DATETIME_CONVERSION",
+                            "message": (
+                                f"fields.{func.value.attr}.{func.attr}() is deprecated. "
+                                "Use native Python datetime / date methods (.isoformat(), .strftime(), or str())."
+                            ),
+                            "suggested_fix": "Replace with native Python date/datetime operations.",
+                        })
+
+            # Check cr.commit() or _cr.commit()
+            if isinstance(func, ast.Attribute) and func.attr == "commit":
+                is_commit = False
+                if isinstance(func.value, ast.Name) and func.value.id in ("cr", "_cr"):
+                    is_commit = True
+                elif isinstance(func.value, ast.Attribute) and func.value.attr in ("cr", "_cr"):
+                    is_commit = True
+                if is_commit:
+                    issues.append({
+                        "file": rel_path,
+                        "line": subnode.lineno,
+                        "class_name": None,
+                        "method_name": None,
+                        "issue_type": "MANUAL_TRANSACTION_COMMIT",
+                        "message": (
+                            "Direct transaction commit (cr.commit()) detected. Manual commits break atomic test "
+                            "suites and rollback safety in modern Odoo."
+                        ),
+                        "suggested_fix": "Remove manual cr.commit() calls and rely on Odoo's transaction management.",
+                    })
+
+    return issues
+
+
 @mcp.tool()
 def migrate_odoo_addon(
     addon_path: str,
@@ -2622,7 +2821,9 @@ def migrate_odoo_addon(
 
     Refactors XML view tags (<tree> -> <list>), converts legacy attrs="..." and states="..."
     dynamic expressions to modern invisible/readonly/required attributes, bumps manifest
-    version, and scaffolds OCA OpenUpgrade database migration templates.
+    version, audits Python AST for deprecated ORM patterns (name_get removal, batch create overrides,
+    fields.Date.to_string, cr.commit()), evaluates Enterprise vs Community edition compatibility,
+    and scaffolds OCA OpenUpgrade database migration templates.
 
     Args:
         addon_path: Absolute or relative path to the Odoo addon directory.
@@ -2680,6 +2881,7 @@ def migrate_odoo_addon(
 
     # 1. Inspect and bump Manifest
     total_files_scanned += 1
+    manifest_depends = []
     try:
         manifest_text = manifest_path.read_text(encoding="utf-8")
         new_manifest, count = MANIFEST_VERSION_PATTERN.subn(
@@ -2701,11 +2903,44 @@ def migrate_odoo_addon(
                 "changes_count": count,
                 "diff": "".join(diff_lines),
             })
+
+        # Parse dependencies for Enterprise / Community edition audit
+        try:
+            m_ast = ast.parse(manifest_text, filename=str(manifest_path))
+            for m_node in m_ast.body:
+                if isinstance(m_node, ast.Expr) and isinstance(m_node.value, ast.Dict):
+                    for k, v in zip(m_node.value.keys, m_node.value.values):
+                        if isinstance(k, ast.Constant) and k.value == "depends":
+                            if isinstance(v, (ast.List, ast.Tuple)):
+                                for item in v.elts:
+                                    if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                                        manifest_depends.append(item.value)
+        except Exception:
+            pass
     except Exception as exc:
         return {
             "success": False,
             "error": f"Failed to read manifest file: {exc}",
         }
+
+    enterprise_deps = sorted(set(d for d in manifest_depends if d in KNOWN_ENTERPRISE_MODULES))
+    has_studio = "web_studio" in manifest_depends or "studio_customization" in manifest_depends
+    edition_requirement = "Enterprise" if (enterprise_deps or has_studio) else "Community"
+
+    enterprise_notes = []
+    if enterprise_deps:
+        enterprise_notes.append(
+            f"Addon depends on Odoo Enterprise module(s): {', '.join(enterprise_deps)}. "
+            "An Odoo Enterprise license and repository access are required for Odoo 19."
+        )
+    if has_studio:
+        enterprise_notes.append(
+            "Addon references Odoo Studio customization components. Ensure Studio is available in target Odoo 19."
+        )
+    if not enterprise_deps and not has_studio:
+        enterprise_notes.append(
+            "Addon has no direct Enterprise dependencies and is compatible with Odoo 19 Community Edition."
+        )
 
     # 2. Inspect and refactor XML view files
     xml_files = sorted(resolved_addon.glob("**/*.xml"))
@@ -2780,7 +3015,42 @@ def migrate_odoo_addon(
         except Exception:
             continue
 
-    # 3. OpenUpgrade Scaffolding
+    # 3. Inspect Python files for AST deprecations
+    py_files = sorted(resolved_addon.glob("**/*.py"))
+    python_files_scanned = 0
+    python_issues = []
+    name_get_count = 0
+    create_without_multi_count = 0
+    deprecated_orm_calls_count = 0
+
+    for py_file in py_files:
+        if (
+            py_file.name.startswith(".")
+            or "_migration_backups" in py_file.parts
+            or "migrations" in py_file.parts
+            or "tests" in py_file.parts
+            or py_file.name == "__manifest__.py"
+        ):
+            continue
+        python_files_scanned += 1
+        total_files_scanned += 1
+        rel_py_path = str(py_file.relative_to(resolved_addon))
+        f_issues = _audit_python_migration_file(py_file, rel_py_path)
+        for issue in f_issues:
+            python_issues.append(issue)
+            if issue["issue_type"] == "NAME_GET_DEPRECATED":
+                name_get_count += 1
+            elif issue["issue_type"] == "CREATE_MISSING_MODEL_CREATE_MULTI":
+                create_without_multi_count += 1
+            elif issue["issue_type"] in (
+                "DEPRECATED_DATETIME_CONVERSION",
+                "NAME_SEARCH_LEGACY_SIGNATURE",
+                "MANUAL_TRANSACTION_COMMIT",
+                "OBSOLETE_DECORATOR",
+            ):
+                deprecated_orm_calls_count += 1
+
+    # 4. OpenUpgrade Scaffolding
     migrations_dir = resolved_addon / "migrations" / f"{clean_target}.1.0"
     scaffold_created = False
     openupgrade_files_planned = []
@@ -2797,7 +3067,7 @@ def migrate_odoo_addon(
         if not readme_file.exists():
             openupgrade_files_planned.append(str(readme_file.relative_to(resolved_addon)))
 
-    # 4. Apply changes or prepare dry-run
+    # 5. Apply changes or prepare dry-run
     backup_path = None
     if not dry_run:
         # Create timestamped backup
@@ -2847,6 +3117,28 @@ def migrate_odoo_addon(
             f"Migration changes applied successfully. Full backup saved to '{backup_path}'."
         )
 
+    if enterprise_deps:
+        suggestions.append(
+            f"Edition requirement: Enterprise. Addon depends on: {', '.join(enterprise_deps)}."
+        )
+
+    if name_get_count > 0:
+        suggestions.append(
+            f"Found {name_get_count} legacy name_get() method(s). Odoo 17+ removed name_get(); "
+            "replace with _compute_display_name() to avoid runtime attribute errors."
+        )
+
+    if create_without_multi_count > 0:
+        suggestions.append(
+            f"Found {create_without_multi_count} create() method(s) missing @api.model_create_multi. "
+            "Update to accept vals_list for batch compatibility in Odoo 19."
+        )
+
+    if deprecated_orm_calls_count > 0:
+        suggestions.append(
+            f"Found {deprecated_orm_calls_count} deprecated ORM or transaction call(s) (e.g., cr.commit() or fields.Date.to_string())."
+        )
+
     if scaffold_openupgrade:
         suggestions.append(
             f"OpenUpgrade migration templates available in 'migrations/{clean_target}.1.0/'. "
@@ -2868,6 +3160,11 @@ def migrate_odoo_addon(
             "states_converted": states_converted_count,
             "manifest_version_bumped": manifest_bumped,
             "openupgrade_scaffolded": scaffold_created,
+            "python_files_scanned": python_files_scanned,
+            "name_get_count": name_get_count,
+            "create_without_multi_count": create_without_multi_count,
+            "deprecated_orm_calls_count": deprecated_orm_calls_count,
+            "edition_requirement": edition_requirement,
         },
         "modified_files": modified_files,
         "openupgrade": {
@@ -2877,6 +3174,13 @@ def migrate_odoo_addon(
                 str(migrations_dir / f) for f in ("pre-migration.py", "post-migration.py", "README.md")
             ],
         },
+        "enterprise_audit": {
+            "edition_requirement": edition_requirement,
+            "enterprise_dependencies": enterprise_deps,
+            "has_studio_customizations": has_studio,
+            "notes": enterprise_notes,
+        },
+        "python_audit": python_issues,
         "suggestions": suggestions,
     }
 

@@ -119,6 +119,13 @@ The `migrate_odoo_addon` tool automates the code migration of custom addons from
 
 Capabilities include:
 - **XML View Modernization**: Automatically converts deprecated `<tree>` tags to `<list>` (mandatory in Odoo 18/19), refactors legacy `attrs="{...}"` dictionaries into direct Python expressions (`invisible="..."`, `readonly="..."`, `required="..."`), and transforms `states="..."` attributes into boolean domain expressions.
+- **Python AST Modernization & Diagnostics**: Statically inspects Python model files to detect breaking API changes:
+  - Detects legacy `name_get()` methods (removed in Odoo 17+) and provides drop-in `_compute_display_name()` implementations.
+  - Flags model `create()` overrides missing `@api.model_create_multi` and provides batch-compatible `vals_list` signatures.
+  - Flags deprecated ORM calls (e.g. `fields.Date.to_string`, `fields.Datetime.from_string`, obsolete `_name_search` signatures).
+  - Flags manual transaction calls (`cr.commit()`) that break test suites and rollback safety.
+  - Flags obsolete legacy decorators (`@api.multi`, `@api.one`, `@api.returns`).
+- **Enterprise vs Community Edition Audit**: Inspects module dependencies against known Odoo Enterprise apps (e.g. `web_studio`, `account_reports`, `helpdesk`, `sign`) and warns if an Enterprise license is required for Odoo 19 or if the module can run on Community.
 - **Manifest Version Bumping**: Updates `version` declarations in `__manifest__.py` to target version `19.0.x.x` while preserving custom sub-versioning formats.
 - **OpenUpgrade Database Scaffolding**: Automatically scaffolds OCA standard `migrations/19.0.1.0/` structure including:
   - `pre-migration.py`: Standard template using `openupgradelib.openupgrade` for table, column, and model renaming before Odoo ORM models load.
@@ -165,7 +172,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 106 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, entry points, and edge cases.
+The current test suite contains 112 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration (XML views, Python AST deprecations, Enterprise edition audit) & OpenUpgrade scaffolding, entry points, and edge cases.
 
 ## Client Configuration
 
