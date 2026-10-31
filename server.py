@@ -1,3 +1,4 @@
+import argparse
 import ast
 import csv
 import datetime
@@ -7,6 +8,7 @@ from pathlib import Path
 import re
 import shutil
 import socket
+import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
 import xml.sax
@@ -4426,9 +4428,369 @@ def scaffold_odoo_tests(
     }
 
 
-def main() -> None:
-    mcp.run()
+def format_cli_report(result: dict, title: str) -> str:
+    """Format structured analyzer output into human-readable terminal report."""
+    lines = [
+        "=" * 80,
+        f" Odoo Developer Assistant: {title}",
+        "=" * 80,
+    ]
+    if "addon_name" in result:
+        lines.append(f"Addon: {result['addon_name']}")
+    if "path" in result:
+        lines.append(f"Path: {result['path']}")
+    elif "addon_path" in result:
+        lines.append(f"Path: {result['addon_path']}")
+    elif "file" in result:
+        lines.append(f"File: {result['file']}")
 
+    status_val = result.get("health_status") or result.get("status")
+    if status_val:
+        lines.append(f"Status: [{status_val}]")
+
+    summary = result.get("summary", {})
+    if summary:
+        lines.append("\nSummary:")
+        for k, v in summary.items():
+            lines.append(f"  - {k.replace('_', ' ').capitalize()}: {v}")
+
+    errors = result.get("errors", [])
+    if errors:
+        lines.append(f"\nErrors ({len(errors)}):")
+        for err in errors:
+            line_info = f" [Line {err['line']}]" if err.get("line") else ""
+            msg = err.get("message", str(err))
+            code = f"{err['code']}: " if err.get("code") else ""
+            lines.append(f"  [ERROR]{line_info} {code}{msg}")
+
+    warnings = result.get("warnings", [])
+    if warnings:
+        lines.append(f"\nWarnings ({len(warnings)}):")
+        for warn in warnings:
+            line_info = f" [Line {warn['line']}]" if warn.get("line") else ""
+            msg = warn.get("message", str(warn))
+            code = f"{warn['code']}: " if warn.get("code") else ""
+            lines.append(f"  [WARN]{line_info} {code}{msg}")
+
+    cross_file = result.get("cross_file_issues", [])
+    if cross_file:
+        lines.append(f"\nCross-File Consistency Issues ({len(cross_file)}):")
+        for cf in cross_file:
+            lines.append(f"  [CONSISTENCY] {cf.get('issue_type', '')}: {cf.get('message', str(cf))}")
+
+    suggestions = result.get("suggestions", [])
+    if suggestions:
+        lines.append("\nSuggestions:")
+        for s in suggestions:
+            lines.append(f"  * {s}")
+
+    lines.append("=" * 80)
+    return "\n".join(lines)
+
+
+def cli_check(path_str: str, fail_on_warning: bool = False, addons_dirs: list[str] | None = None) -> int:
+    """Run static check on an addon directory or individual file."""
+    try:
+        target = Path(path_str).expanduser().resolve()
+    except Exception as exc:
+        print(f"[ERROR] Invalid path: {exc}", file=sys.stderr)
+        return 2
+
+    if not target.exists():
+        print(f"[ERROR] Path does not exist: {target}", file=sys.stderr)
+        return 2
+
+    if target.is_dir():
+        manifest_file = target / "__manifest__.py"
+        if manifest_file.is_file():
+            res = check_odoo_addon_health(str(target), addons_directories=addons_dirs)
+            if not res.get("success"):
+                print(f"[ERROR] {res.get('error', 'Health check failed')}", file=sys.stderr)
+                return 2
+            report = format_cli_report(res, f"Addon Health Check ({target.name})")
+            print(report)
+            status = res.get("health_status") or res.get("status")
+            if status == "CRITICAL_ISSUES":
+                return 1
+            if fail_on_warning and status != "HEALTHY":
+                return 1
+            return 0
+        else:
+            js_or_xml = list(target.glob("**/*.js")) + list(target.glob("**/*.xml"))
+            if js_or_xml:
+                res = analyze_odoo_owl_component(str(target))
+                if not res.get("success"):
+                    print(f"[ERROR] {res.get('error')}", file=sys.stderr)
+                    return 2
+                report = format_cli_report(res, f"OWL Component Audit ({target.name})")
+                print(report)
+                if res.get("errors"):
+                    return 1
+                if fail_on_warning and res.get("warnings"):
+                    return 1
+                return 0
+            else:
+                print(f"[ERROR] Directory is not an Odoo addon (no __manifest__.py found): {target}", file=sys.stderr)
+                return 2
+
+    ext = target.suffix.lower()
+    if ext == ".xml":
+        res = analyze_odoo_xml_view(str(target))
+        title = f"XML View Analysis ({target.name})"
+    elif ext == ".py":
+        res = analyze_odoo_python_model(str(target))
+        title = f"Python Model Analysis ({target.name})"
+    elif ext == ".csv":
+        res = analyze_odoo_security(str(target))
+        title = f"Security Access CSV Analysis ({target.name})"
+    elif ext == ".js":
+        res = analyze_odoo_owl_component(str(target))
+        title = f"OWL JavaScript Analysis ({target.name})"
+    else:
+        print(f"[ERROR] Unsupported file extension '{ext}'. Expected .xml, .py, .csv, or .js.", file=sys.stderr)
+        return 2
+
+    if not res.get("success"):
+        print(f"[ERROR] {res.get('error', 'Analysis failed')}", file=sys.stderr)
+        return 2
+
+    report = format_cli_report(res, title)
+    print(report)
+
+    if res.get("errors"):
+        return 1
+    if fail_on_warning and res.get("warnings"):
+        return 1
+    return 0
+
+
+def cli_migrate(addon_path: str, target_version: str = "19.0", apply: bool = False) -> int:
+    """Run Odoo addon migration via CLI."""
+    res = migrate_odoo_addon(addon_path, target_version=target_version, dry_run=not apply)
+    if not res.get("success"):
+        print(f"[ERROR] {res.get('error', 'Migration failed')}", file=sys.stderr)
+        return 2
+
+    print("=" * 80)
+    mode_str = "APPLIED CHANGES" if apply else "DRY RUN PREVIEW"
+    print(f" Odoo Developer Assistant: Migration to Odoo {target_version} [{mode_str}]")
+    print("=" * 80)
+    print(f"Addon: {res.get('addon_name')}")
+    print(f"Path: {res.get('addon_path')}")
+    if res.get("backup_path"):
+        print(f"Backup created at: {res.get('backup_path')}")
+
+    summary = res.get("summary", {})
+    if summary:
+        print("\nSummary:")
+        for k, v in summary.items():
+            print(f"  - {k.replace('_', ' ').capitalize()}: {v}")
+
+    modified_files = res.get("modified_files", [])
+    if modified_files:
+        print(f"\nModified Files ({len(modified_files)}):")
+        for mf in modified_files:
+            print(f"\n--- {mf['file']} ({mf['type']}, {mf['changes_count']} change(s)) ---")
+            if "diff" in mf and mf["diff"]:
+                print(mf["diff"])
+
+    suggestions = res.get("suggestions", [])
+    if suggestions:
+        print("\nSuggestions:")
+        for s in suggestions:
+            print(f"  * {s}")
+    print("=" * 80)
+    return 0
+
+
+def cli_scaffold_tests(
+    addon_path: str,
+    test_type: str = "all",
+    apply: bool = False,
+    overwrite: bool = False,
+) -> int:
+    """Scaffold automated test suites via CLI."""
+    res = scaffold_odoo_tests(
+        addon_path,
+        test_type=test_type,
+        dry_run=not apply,
+        overwrite=overwrite,
+    )
+    if not res.get("success"):
+        print(f"[ERROR] {res.get('error', 'Test scaffolding failed')}", file=sys.stderr)
+        return 2
+
+    print("=" * 80)
+    mode_str = "WRITTEN TO DISK" if apply else "DRY RUN PREVIEW"
+    print(f" Odoo Developer Assistant: Test Scaffolding [{mode_str}]")
+    print("=" * 80)
+    print(f"Addon: {res.get('addon_name')}")
+    print(f"Target Directory: {res.get('tests_directory')}")
+
+    summary = res.get("summary", {})
+    if summary:
+        print("\nSummary:")
+        for k, v in summary.items():
+            print(f"  - {k.replace('_', ' ').capitalize()}: {v}")
+
+    files = res.get("files", [])
+    if files:
+        print(f"\nFiles ({len(files)}):")
+        for f in files:
+            print(f"  - {f['file']} [{f['status']}]")
+
+    suggestions = res.get("suggestions", [])
+    if suggestions:
+        print("\nSuggestions:")
+        for s in suggestions:
+            print(f"  * {s}")
+    print("=" * 80)
+    return 0
+
+
+def cli_install_hook(git_dir: str = ".git") -> int:
+    """Install git pre-commit hook into repository."""
+    try:
+        git_path = Path(git_dir).expanduser().resolve()
+    except Exception as exc:
+        print(f"[ERROR] Invalid git directory path: {exc}", file=sys.stderr)
+        return 2
+
+    if not git_path.exists() or not git_path.is_dir():
+        print(f"[ERROR] Git directory not found: {git_path}. Are you in a git repository?", file=sys.stderr)
+        return 2
+
+    hooks_dir = git_path / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook_file = hooks_dir / "pre-commit"
+
+    hook_script = """#!/usr/bin/env bash
+# Odoo Developer Assistant - Git Pre-Commit Hook
+# Statically validates modified Odoo files and addons before commit.
+
+set -e
+
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+
+if [ -z "$STAGED_FILES" ]; then
+    exit 0
+fi
+
+# Detect runner
+RUNNER=""
+if command -v odoo-developer-assistant >/dev/null 2>&1; then
+    RUNNER="odoo-developer-assistant"
+elif [ -x "./.venv/bin/odoo-developer-assistant" ]; then
+    RUNNER="./.venv/bin/odoo-developer-assistant"
+elif [ -x "./.venv/bin/python" ] && [ -f "server.py" ]; then
+    RUNNER="./.venv/bin/python server.py"
+elif command -v python3 >/dev/null 2>&1 && [ -f "server.py" ]; then
+    RUNNER="python3 server.py"
+elif command -v python >/dev/null 2>&1 && [ -f "server.py" ]; then
+    RUNNER="python server.py"
+fi
+
+if [ -z "$RUNNER" ]; then
+    echo "[odoo-assistant] Warning: Could not locate odoo-developer-assistant or python environment. Skipping check."
+    exit 0
+fi
+
+FAILED=0
+
+for FILE in $STAGED_FILES; do
+    case "$FILE" in
+        *.py|*.xml|*.csv|*.js)
+            if [ -f "$FILE" ]; then
+                echo "[odoo-assistant] Checking $FILE..."
+                $RUNNER check "$FILE" || FAILED=1
+            fi
+            ;;
+    esac
+done
+
+if [ $FAILED -ne 0 ]; then
+    echo ""
+    echo "======================================================================"
+    echo "COMMIT REJECTED: Odoo Developer Assistant detected issues in staged files."
+    echo "Fix the errors above before committing or use git commit --no-verify."
+    echo "======================================================================"
+    exit 1
+fi
+
+exit 0
+"""
+    try:
+        hook_file.write_text(hook_script, encoding="utf-8")
+        hook_file.chmod(hook_file.stat().st_mode | 0o111)
+        print(f"[SUCCESS] Git pre-commit hook installed to: {hook_file}")
+        return 0
+    except Exception as exc:
+        print(f"[ERROR] Failed to write git hook: {exc}", file=sys.stderr)
+        return 2
+
+
+def cli_main(args: list[str] | None = None) -> int:
+    """Main CLI command line entry dispatcher."""
+    if args is None:
+        args = sys.argv[1:]
+
+    parser = argparse.ArgumentParser(
+        prog="odoo-developer-assistant",
+        description="Odoo Developer Assistant: Fast CLI runner and pre-commit hook for Odoo developers.",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
+
+    check_p = subparsers.add_parser("check", help="Static health check for an addon directory or file.")
+    check_p.add_argument("path", help="Path to addon directory or file (.xml, .py, .csv, .js)")
+    check_p.add_argument("--fail-on-warning", action="store_true", help="Exit with code 1 if warnings are found.")
+    check_p.add_argument("--addons-dir", action="append", dest="addons_dirs", help="Additional addons directory for dependency checks.")
+
+    migrate_p = subparsers.add_parser("migrate", help="Migrate an addon to Odoo 19.")
+    migrate_p.add_argument("addon_path", help="Path to addon directory")
+    migrate_p.add_argument("--target-version", default="19.0", help="Target Odoo version (default: 19.0)")
+    migrate_p.add_argument("--apply", action="store_true", help="Apply changes directly to disk (creates backup).")
+
+    tests_p = subparsers.add_parser("scaffold-tests", help="Scaffold automated test suites for an addon.")
+    tests_p.add_argument("addon_path", help="Path to addon directory")
+    tests_p.add_argument("--test-type", default="all", choices=["all", "unit", "access_rights"], help="Test type (default: all)")
+    tests_p.add_argument("--apply", action="store_true", help="Write generated test files to disk.")
+    tests_p.add_argument("--overwrite", action="store_true", help="Overwrite existing test files.")
+
+    hook_p = subparsers.add_parser("install-hook", help="Install git pre-commit hook in a repository.")
+    hook_p.add_argument("--git-dir", default=".git", help="Path to .git directory (default: .git)")
+
+    subparsers.add_parser("server", help="Run in MCP server mode.")
+
+    parsed = parser.parse_args(args)
+
+    if not parsed.command or parsed.command == "server":
+        mcp.run()
+        return 0
+
+    if parsed.command == "check":
+        return cli_check(parsed.path, fail_on_warning=parsed.fail_on_warning, addons_dirs=parsed.addons_dirs)
+    elif parsed.command == "migrate":
+        return cli_migrate(parsed.addon_path, target_version=parsed.target_version, apply=parsed.apply)
+    elif parsed.command == "scaffold-tests":
+        return cli_scaffold_tests(parsed.addon_path, test_type=parsed.test_type, apply=parsed.apply, overwrite=parsed.overwrite)
+    elif parsed.command == "install-hook":
+        return cli_install_hook(git_dir=parsed.git_dir)
+
+    return 0
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Main entry point: launches MCP server by default or dispatches CLI runner."""
+    args = sys.argv[1:] if argv is None else argv
+    if not args or args == ["--stdio"] or args == ["server"]:
+        mcp.run()
+        return
+
+    cli_subcommands = {"check", "migrate", "scaffold-tests", "install-hook", "-h", "--help"}
+    if args and (args[0] in cli_subcommands):
+        sys.exit(cli_main(args))
+
+    mcp.run()
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ dependencies = [
 
 [project.scripts]
 odoo-developer-assistant = "server:main"
+odoo-assistant = "server:main"
 
 [tool.setuptools]
 py-modules = ["server"]

@@ -1,0 +1,7 @@
+- id: odoo-addon-health-check
+  name: Odoo Addon Health Check
+  description: Statically validate manifests, XML views, Python models, security CSV rules, and modern OWL components before commit.
+  entry: odoo-developer-assistant check
+  language: python
+  pass_filenames: true
+  types_or: [python, xml, csv, javascript]

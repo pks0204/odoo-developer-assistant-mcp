@@ -1,4 +1,5 @@
 import ast
+import os
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,6 +10,12 @@ from server import (
     analyze_odoo_security,
     analyze_odoo_xml_view,
     check_odoo_addon_health,
+    cli_check,
+    cli_install_hook,
+    cli_main,
+    cli_migrate,
+    cli_scaffold_tests,
+    format_cli_report,
     generate_openupgrade_scripts,
     inspect_odoo_module,
     main,
@@ -2775,3 +2782,165 @@ def test_scaffold_odoo_tests_fallback_install_test(tmp_path: Path):
     content = install_test.read_text(encoding="utf-8")
     assert "class TestModuleInstall(TransactionCase):" in content
     assert 'ir.module.module' in content
+
+
+# --------------------------------------------------
+# Tests for CLI Runner & Git Pre-Commit Hook
+# --------------------------------------------------
+
+def test_cli_main_server_mode():
+    with patch("server.mcp.run") as mock_run:
+        exit_code = cli_main(["server"])
+        assert exit_code == 0
+        mock_run.assert_called_once()
+
+
+def test_cli_main_via_main_dispatcher():
+    with patch("server.mcp.run") as mock_run:
+        main(["--stdio"])
+        mock_run.assert_called_once()
+
+
+def test_cli_check_addon_healthy(tmp_path: Path):
+    addon = tmp_path / "healthy_addon"
+    _create_full_valid_addon(addon)
+
+    exit_code = cli_main(["check", str(addon)])
+    assert exit_code == 0
+
+
+def test_cli_check_addon_critical_issues(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Broken Addon", "version": "18.0.1.0.0", "depends": ["base"]})
+    views_dir = addon / "views"
+    views_dir.mkdir()
+    (views_dir / "broken.xml").write_text("<odoo><record id='broken'>", encoding="utf-8")
+
+    exit_code = cli_main(["check", str(addon)])
+    assert exit_code == 1
+
+
+def test_cli_check_fail_on_warning_flag(tmp_path: Path):
+    addon = tmp_path / "warning_addon"
+    _create_full_valid_addon(addon)
+
+    # Introduce a suspicious ondelete value to trigger a warning without critical errors
+    order_file = addon / "models" / "order.py"
+    order_file.write_text(
+        "from odoo import models, fields\n\n"
+        "class CustomOrder(models.Model):\n"
+        "    _name = 'custom.order'\n"
+        "    _description = 'Custom Order'\n"
+        "    name = fields.Char(string='Reference')\n"
+        "    partner_id = fields.Many2one('res.partner', string='Partner', ondelete='invalid_mode')\n",
+        encoding="utf-8",
+    )
+
+    exit_code_normal = cli_main(["check", str(addon)])
+    assert exit_code_normal == 0
+
+    exit_code_strict = cli_main(["check", str(addon), "--fail-on-warning"])
+    assert exit_code_strict == 1
+
+
+def test_cli_check_single_file_routing(tmp_path: Path):
+    # Valid XML view file
+    xml_file = tmp_path / "view.xml"
+    xml_file.write_text("<odoo><record id='test_view' model='ir.ui.view'><field name='arch' type='xml'><form/></field></record></odoo>", encoding="utf-8")
+    assert cli_main(["check", str(xml_file)]) == 0
+
+    # Malformed XML view file
+    bad_xml = tmp_path / "bad.xml"
+    bad_xml.write_text("<odoo><unclosed>", encoding="utf-8")
+    assert cli_main(["check", str(bad_xml)]) == 1
+
+    # Valid Python model file
+    py_file = tmp_path / "model.py"
+    py_file.write_text("from odoo import models, fields\nclass Item(models.Model):\n    _name = 'item'\n    _description = 'Item'\n", encoding="utf-8")
+    assert cli_main(["check", str(py_file)]) == 0
+
+    # Valid Security CSV file
+    csv_file = tmp_path / "ir.model.access.csv"
+    csv_file.write_text("id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\nacc,acc,model_item,base.group_user,1,1,1,1\n", encoding="utf-8")
+    assert cli_main(["check", str(csv_file)]) == 0
+
+    # Valid OWL JS file
+    js_file = tmp_path / "comp.js"
+    js_file.write_text("/** @odoo-module **/\nimport { Component } from '@odoo/owl';\nexport class MyComp extends Component {}\n", encoding="utf-8")
+    assert cli_main(["check", str(js_file)]) == 0
+
+
+def test_cli_migrate_dry_run_and_apply(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Migrate CLI", "version": "18.0.1.0.0"})
+    # dry run
+    code_dry = cli_main(["migrate", str(addon), "--target-version", "19.0"])
+    assert code_dry == 0
+    assert not (addon / "migrations").exists()
+
+    # apply
+    code_apply = cli_main(["migrate", str(addon), "--target-version", "19.0", "--apply"])
+    assert code_apply == 0
+    assert (addon / "migrations" / "19.0.1.0" / "pre-migration.py").exists()
+
+
+def test_cli_scaffold_tests(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Scaffold CLI", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "item.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class Item(models.Model):\n"
+        "    _name = 'test.item'\n"
+        "    _description = 'Item'\n",
+        encoding="utf-8",
+    )
+
+    code = cli_main(["scaffold-tests", str(addon), "--apply"])
+    assert code == 0
+    assert (addon / "tests" / "test_test_item.py").exists()
+
+
+def test_cli_install_hook_creates_executable(tmp_path: Path):
+    git_dir = tmp_path / ".git"
+    git_dir.mkdir()
+
+    code = cli_main(["install-hook", "--git-dir", str(git_dir)])
+    assert code == 0
+
+    hook_file = git_dir / "hooks" / "pre-commit"
+    assert hook_file.exists()
+    content = hook_file.read_text(encoding="utf-8")
+    assert "$RUNNER check" in content
+    assert os.access(hook_file, os.X_OK)
+
+
+def test_cli_invalid_arguments_returns_error_code(tmp_path: Path):
+    # Nonexistent path
+    code_nonexistent = cli_main(["check", str(tmp_path / "does_not_exist")])
+    assert code_nonexistent == 2
+
+    # Unsupported file type
+    txt_file = tmp_path / "some.txt"
+    txt_file.write_text("hello", encoding="utf-8")
+    code_unsupported = cli_main(["check", str(txt_file)])
+    assert code_unsupported == 2
+
+
+def test_format_cli_report():
+    dummy = {
+        "addon_name": "my_module",
+        "status": "NEEDS_ATTENTION",
+        "summary": {"files_scanned": 5},
+        "errors": [{"line": 10, "code": "ERR_1", "message": "Bad error"}],
+        "warnings": [{"line": 20, "code": "WARN_1", "message": "Minor warning"}],
+        "cross_file_issues": [{"issue_type": "MISSING_RULE", "message": "No security rule"}],
+        "suggestions": ["Fix errors"],
+    }
+    report = format_cli_report(dummy, "Test Report")
+    assert "Odoo Developer Assistant: Test Report" in report
+    assert "Addon: my_module" in report
+    assert "Status: [NEEDS_ATTENTION]" in report
+    assert "Files scanned: 5" in report
+    assert "[ERROR] [Line 10] ERR_1: Bad error" in report
+    assert "[WARN] [Line 20] WARN_1: Minor warning" in report
+    assert "[CONSISTENCY] MISSING_RULE: No security rule" in report
+    assert "* Fix errors" in report

@@ -169,6 +169,73 @@ Capabilities include:
 - **Access Rights Verification**: Parses `security/ir.model.access.csv` and scaffolds security permission tests (`check_access_rights("read")`).
 - **Clean Registration & Overwrite Protection**: Maintains `tests/__init__.py` imports, defaults to `dry_run=True` for safe code previewing, and respects `overwrite=False` to preserve existing custom test code.
 
+### 13. Standalone CLI Runner & Pre-Commit Git Hook
+
+The project provides a standalone terminal CLI runner (`odoo-developer-assistant` and shorthand alias `odoo-assistant`) that lets developers and CI/CD pipelines run health checks, migrations, and test scaffolding without needing an active LLM or MCP client.
+
+Capabilities include:
+- **Terminal Health Checks**: Inspect entire addons or individual files directly:
+  ```bash
+  odoo-developer-assistant check /path/to/addon
+  odoo-developer-assistant check views/order_views.xml
+  odoo-developer-assistant check models/order.py
+  odoo-developer-assistant check static/src/components/counter.js
+  ```
+- **CI / Git Pre-Commit Strict Mode**: Exit code `0` on clean/healthy runs, `1` on critical errors (or on warnings with `--fail-on-warning`), and `2` on invalid inputs.
+- **One-Command Git Hook Installation**:
+  ```bash
+  odoo-developer-assistant install-hook
+  ```
+  Installs an executable `.git/hooks/pre-commit` hook that automatically checks all staged Odoo files before every commit, rejecting broken code.
+- **Pre-Commit Framework Integration**: Ready-to-use `.pre-commit-hooks.yaml` for repositories using the standard `pre-commit` tool.
+
+## Standalone CLI & Git Pre-Commit Usage
+
+### 1. Run Health Checks
+```bash
+# Check an addon directory
+odoo-developer-assistant check sample_addons/my_custom_module
+
+# Check a single view or model file
+odoo-developer-assistant check tests/fixtures/valid_view.xml
+
+# Fail CI/CD build if any warnings or critical errors are detected
+odoo-developer-assistant check /path/to/addon --fail-on-warning
+```
+
+### 2. Scaffold Tests from Terminal
+```bash
+# Preview generated test suites
+odoo-developer-assistant scaffold-tests /path/to/addon
+
+# Write test files directly to disk
+odoo-developer-assistant scaffold-tests /path/to/addon --apply
+```
+
+### 3. Run Migrations from Terminal
+```bash
+# Preview Odoo 19 migration diffs
+odoo-developer-assistant migrate /path/to/addon --target-version 19.0
+
+# Apply migration and save timestamped backup
+odoo-developer-assistant migrate /path/to/addon --target-version 19.0 --apply
+```
+
+### 4. Install Git Pre-Commit Hook
+```bash
+# Install pre-commit hook into your local git repository
+odoo-developer-assistant install-hook
+```
+
+Or add to your repository's `.pre-commit-config.yaml`:
+```yaml
+repos:
+  - repo: https://github.com/pks0204/odoo-developer-assistant-mcp
+    rev: v0.1.0
+    hooks:
+      - id: odoo-addon-health-check
+```
+
 ## Requirements
 
 - Python 3.12 or a compatible Python version
@@ -206,7 +273,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 139 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, entry points, and edge cases.
+The current test suite contains 150 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, entry points, and edge cases.
 
 ## Client Configuration
 
