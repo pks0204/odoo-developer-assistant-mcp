@@ -147,6 +147,17 @@ Capabilities include:
 - **QWeb Template Validation**: Verifies `<templates>` root structure, unique `t-name` declarations, and flags security-deprecated `t-raw` attributes in favor of `t-out`.
 - **Cross-File Template Resolution**: When inspecting a directory or addon, cross-references component `static template = "..."` declarations against defined `<t t-name="...">` templates to catch missing or mistyped template names before runtime.
 
+### 11. Automated OpenUpgrade Script Generator
+
+The `generate_openupgrade_scripts` tool generates production-ready OCA OpenUpgrade migration scripts (`pre-migration.py`, `post-migration.py`, `README.md`) in `migrations/<target_version>.1.0/` to handle relational schema and database record migrations.
+
+Capabilities include:
+- **Pre-Migration Column & Model Renames**: Emits concrete `openupgradelib.openupgrade.rename_columns()` and `openupgrade.rename_models()` mapping dictionaries to rename tables/columns in PostgreSQL before Odoo ORM models load.
+- **Pre-Migration XML ID Renames**: Generates `openupgrade.rename_xmlids()` lists to preserve database record identity when XML views or action IDs change across versions.
+- **Post-Migration Selection Key Migrations**: Formulates safe, parameterized SQL updates (`env.cr.execute(...)`) to transform legacy selection field keys into new values.
+- **Post-Migration Compute Field Backfills**: Produces batch ORM search and recompute code (`records._compute_<field>()`) to backfill new stored computed fields for historical records.
+- **Safety & Idempotency**: Defaults to `dry_run=True` to preview generated Python code without touching disk; provides `overwrite=False` safeguards to protect existing manual migration scripts from accidental overwrite.
+
 ## Requirements
 
 - Python 3.12 or a compatible Python version
@@ -184,7 +195,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 123 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, entry points, and edge cases.
+The current test suite contains 130 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -242,6 +253,7 @@ Once configured, you can prompt your AI assistant with queries like:
 - *"Verify my `security/ir.model.access.csv` permissions file."*
 - *"Migrate my Odoo 16 module at `/path/to/my_addon` to Odoo 19: preview the diffs first with dry_run, then scaffold OpenUpgrade database scripts."*
 - *"Inspect my frontend component at `static/src/components/counter.js` and its QWeb XML template for modern OWL 2 compatibility."*
+- *"Generate OpenUpgrade migration scripts for `/path/to/my_addon` to rename column `client_order_ref` to `customer_reference` on `sale_order` and backfill computed field `amount_tax`."*
 
 ## Run with MCP Inspector
 

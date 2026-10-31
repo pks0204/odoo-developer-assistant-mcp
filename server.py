@@ -2541,64 +2541,205 @@ TREE_OPEN_PATTERN = re.compile(r'<tree(\s|>)')
 TREE_CLOSE_PATTERN = re.compile(r'</tree>')
 MANIFEST_VERSION_PATTERN = re.compile(r'([\'\"]version[\'\"]\s*:\s*[\'\"])(?:\d+\.\d+)(\.[^\'\"]+)?([\'\"])')
 
-PRE_MIGRATION_TEMPLATE = '''"""OpenUpgrade pre-migration script for Odoo {target_version}.
+def _build_pre_migration_script(
+    target_version: str,
+    column_renames: dict | None = None,
+    model_renames: list | None = None,
+    xmlid_renames: list | None = None,
+) -> str:
+    """Build a pre-migration.py script for OpenUpgrade with concrete or scaffolded renames."""
+    clean_target = str(target_version).strip() or "19.0"
 
-Executed in PostgreSQL before Odoo models load.
-Use openupgradelib to rename tables, columns, and convert data structures without data loss.
-"""
-import logging
-from openupgradelib import openupgrade
+    col_str = "COLUMN_RENAMES = {\n"
+    if column_renames and isinstance(column_renames, dict):
+        for table, pairs in column_renames.items():
+            table_name = str(table).replace(".", "_")
+            col_str += f'    "{table_name}": [\n'
+            for pair in pairs:
+                if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                    col_str += f'        ("{pair[0]}", "{pair[1]}"),\n'
+            col_str += "    ],\n"
+    else:
+        col_str += (
+            '    # "sale_order": [\n'
+            '    #     ("old_column_name", "new_column_name"),\n'
+            '    # ],\n'
+        )
+    col_str += "}\n"
 
-_logger = logging.getLogger(__name__)
+    mod_str = "MODEL_RENAMES = [\n"
+    if model_renames and isinstance(model_renames, (list, tuple)):
+        for pair in model_renames:
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                mod_str += f'    ("{pair[0]}", "{pair[1]}"),\n'
+    else:
+        mod_str += '    # ("custom.old.model", "custom.new.model"),\n'
+    mod_str += "]\n"
+
+    xml_str = "XMLID_RENAMES = [\n"
+    if xmlid_renames and isinstance(xmlid_renames, (list, tuple)):
+        for pair in xmlid_renames:
+            if isinstance(pair, (list, tuple)) and len(pair) >= 2:
+                xml_str += f'    ("{pair[0]}", "{pair[1]}"),\n'
+    else:
+        xml_str += '    # ("my_module.old_view_id", "my_module.new_view_id"),\n'
+    xml_str += "]\n"
+
+    has_concrete_cols = bool(column_renames)
+    has_concrete_mods = bool(model_renames)
+    has_concrete_xml = bool(xmlid_renames)
+
+    lines = [
+        f'"""OpenUpgrade pre-migration script for Odoo {clean_target}.',
+        "",
+        "Executed in PostgreSQL before Odoo models load.",
+        "Use openupgradelib to rename tables, columns, and convert data structures without data loss.",
+        '"""',
+        "import logging",
+        "from openupgradelib import openupgrade",
+        "",
+        "_logger = logging.getLogger(__name__)",
+        "",
+        col_str.strip(),
+        "",
+        mod_str.strip(),
+        "",
+        xml_str.strip(),
+        "",
+        "",
+        "@openupgrade.migrate()",
+        "def migrate(env, version):",
+        '    _logger.info("Starting pre-migration for database %s to %s", env.cr.dbname, version)',
+        "",
+    ]
+
+    if has_concrete_cols:
+        lines.extend([
+            "    if COLUMN_RENAMES:",
+            '        _logger.info("Renaming columns: %s", COLUMN_RENAMES)',
+            "        openupgrade.rename_columns(env.cr, COLUMN_RENAMES)",
+            "",
+        ])
+    else:
+        lines.extend([
+            "    # Example: openupgrade.rename_columns(env.cr, COLUMN_RENAMES)",
+            "",
+        ])
+
+    if has_concrete_mods:
+        lines.extend([
+            "    if MODEL_RENAMES:",
+            '        _logger.info("Renaming models: %s", MODEL_RENAMES)',
+            "        openupgrade.rename_models(env.cr, MODEL_RENAMES)",
+            "",
+        ])
+    else:
+        lines.extend([
+            "    # Example: openupgrade.rename_models(env.cr, MODEL_RENAMES)",
+            "",
+        ])
+
+    if has_concrete_xml:
+        lines.extend([
+            "    if XMLID_RENAMES:",
+            '        _logger.info("Renaming XML IDs: %s", XMLID_RENAMES)',
+            "        openupgrade.rename_xmlids(env.cr, XMLID_RENAMES)",
+            "",
+        ])
+    else:
+        lines.extend([
+            "    # Example: openupgrade.rename_xmlids(env.cr, XMLID_RENAMES)",
+            "",
+        ])
+
+    return "\n".join(lines).strip() + "\n"
 
 
-@openupgrade.migrate()
-def migrate(env, version):
-    _logger.info("Starting pre-migration for database %s to %s", env.cr.dbname, version)
+def _build_post_migration_script(
+    target_version: str,
+    selection_renames: dict | None = None,
+    compute_backfills: list | None = None,
+) -> str:
+    """Build a post-migration.py script for OpenUpgrade with concrete or scaffolded data migration."""
+    clean_target = str(target_version).strip() or "19.0"
 
-    # Example: Rename a database column
-    # openupgrade.rename_columns(
-    #     env.cr,
-    #     {
-    #         "sale_order": [
-    #             ("old_column_name", "new_column_name"),
-    #         ],
-    #     },
-    # )
+    lines = [
+        f'"""OpenUpgrade post-migration script for Odoo {clean_target}.',
+        "",
+        "Executed after Odoo models have been loaded and updated in the database.",
+        "Use Python ORM code to compute new fields, re-link records, and clean up.",
+        '"""',
+        "import logging",
+        "from openupgradelib import openupgrade",
+        "",
+        "_logger = logging.getLogger(__name__)",
+        "",
+        "",
+        "@openupgrade.migrate()",
+        "def migrate(env, version):",
+        '    _logger.info("Starting post-migration for database %s to %s", env.cr.dbname, version)',
+        "",
+    ]
 
-    # Example: Rename a model / table
-    # openupgrade.rename_models(
-    #     env.cr,
-    #     [
-    #         ("custom.old.model", "custom.new.model"),
-    #     ],
-    # )
-'''
+    if selection_renames and isinstance(selection_renames, dict):
+        lines.append("    # 1. Selection key migrations (SQL updates)")
+        for table, col_map in selection_renames.items():
+            table_name = str(table).replace(".", "_")
+            if isinstance(col_map, dict):
+                for column, val_map in col_map.items():
+                    if isinstance(val_map, dict):
+                        for old_val, new_val in val_map.items():
+                            lines.append(
+                                f'    env.cr.execute("UPDATE {table_name} SET {column} = %s WHERE {column} = %s", ({repr(new_val)}, {repr(old_val)}))'
+                            )
+        lines.append("")
+    else:
+        lines.extend([
+            "    # 1. Selection key migrations (SQL updates)",
+            '    # env.cr.execute("UPDATE sale_order SET state = %s WHERE state = %s", ("quotation", "draft"))',
+            "",
+        ])
 
-POST_MIGRATION_TEMPLATE = '''"""OpenUpgrade post-migration script for Odoo {target_version}.
+    if compute_backfills and isinstance(compute_backfills, (list, tuple)):
+        lines.append("    # 2. Recompute newly added stored fields")
+        for item in compute_backfills:
+            if isinstance(item, dict) and "model" in item:
+                model_name = item["model"]
+                field_name = item.get("field")
+                if field_name:
+                    lines.extend([
+                        f'    records = env["{model_name}"].search([("{field_name}", "=", False)])',
+                        '    if records:',
+                        f'        _logger.info("Recomputing %d {model_name} records for {field_name}", len(records))',
+                        f'        records._compute_{field_name}() if hasattr(records, "_compute_{field_name}") else None',
+                    ])
+                else:
+                    lines.extend([
+                        f'    records = env["{model_name}"].search([])',
+                        f'    _logger.info("Found %d {model_name} records", len(records))',
+                    ])
+        lines.append("")
+    else:
+        lines.extend([
+            "    # 2. Recompute newly added stored fields",
+            '    # records = env["custom.order"].search([("computed_total", "=", False)])',
+            '    # if records:',
+            '    #     records._compute_total()',
+            "",
+        ])
 
-Executed after Odoo models have been loaded and updated in the database.
-Use Python ORM code to compute new fields, re-link records, and clean up.
-"""
-import logging
-from openupgradelib import openupgrade
-
-_logger = logging.getLogger(__name__)
+    return "\n".join(lines).strip() + "\n"
 
 
-@openupgrade.migrate()
-def migrate(env, version):
-    _logger.info("Starting post-migration for database %s to %s", env.cr.dbname, version)
+def _build_migrations_readme(
+    target_version: str,
+    addon_name: str,
+) -> str:
+    """Build README.md for an addon migrations directory."""
+    clean_target = str(target_version).strip() or "19.0"
+    return f"""# OpenUpgrade Migration Directory
 
-    # Example: Populate newly added compute / stored fields
-    # records = env["custom.order"].search([("new_field", "=", False)])
-    # for rec in records:
-    #     rec.new_field = rec.partner_id.name
-'''
-
-MIGRATIONS_README_TEMPLATE = '''# OpenUpgrade Migration Directory
-
-This directory contains database migration scripts for upgrading this addon to Odoo {target_version}.
+This directory contains database migration scripts for upgrading this addon to Odoo {clean_target}.
 
 ## Structure
 - `pre-migration.py`: Runs before model schema updates. Ideal for table and column renames via `openupgradelib`.
@@ -2609,7 +2750,170 @@ Run with OpenUpgrade or invoke via standard Odoo CLI:
 ```bash
 odoo-bin -c odoo.conf -u {addon_name} -d <database_name> --stop-after-init
 ```
-'''
+"""
+
+
+PRE_MIGRATION_TEMPLATE = _build_pre_migration_script("{target_version}")
+POST_MIGRATION_TEMPLATE = _build_post_migration_script("{target_version}")
+MIGRATIONS_README_TEMPLATE = _build_migrations_readme("{target_version}", "{addon_name}")
+
+
+@mcp.tool()
+def generate_openupgrade_scripts(
+    addon_path: str,
+    target_version: str = "19.0",
+    column_renames: dict | None = None,
+    model_renames: list | None = None,
+    xmlid_renames: list | None = None,
+    selection_renames: dict | None = None,
+    compute_backfills: list | None = None,
+    dry_run: bool = True,
+    overwrite: bool = False,
+) -> dict:
+    """Generate production-ready OpenUpgrade database migration scripts (pre-migration.py,
+    post-migration.py, README.md) with column, model, XML ID renames, selection value updates,
+    and compute field backfills.
+
+    Args:
+        addon_path: Path to the Odoo addon directory.
+        target_version: Target Odoo version (default: '19.0').
+        column_renames: Optional dict of table to list of (old_col, new_col) tuples,
+            e.g. {"sale_order": [("old_ref", "new_ref")]}.
+        model_renames: Optional list of (old_model, new_model) tuples,
+            e.g. [("old.model", "new.model")].
+        xmlid_renames: Optional list of (old_xml_id, new_xml_id) tuples,
+            e.g. [("my_module.old_view", "my_module.new_view")].
+        selection_renames: Optional dict of table to {column: {old_val: new_val}},
+            e.g. {"sale_order": {"state": {"draft": "quotation"}}}.
+        compute_backfills: Optional list of dicts with model and field,
+            e.g. [{"model": "sale.order", "field": "amount_tax"}].
+        dry_run: If True, previews generated scripts without writing to disk.
+        overwrite: If True, overwrites existing migration files in migrations/<version>.1.0/.
+    """
+    if not isinstance(addon_path, str) or not addon_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide an addon directory path as text.",
+        }
+
+    try:
+        resolved_addon = Path(addon_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid addon path: {exc}",
+        }
+
+    if not resolved_addon.exists():
+        return {
+            "success": False,
+            "error": f"Addon directory does not exist: {resolved_addon}",
+        }
+
+    if not resolved_addon.is_dir():
+        return {
+            "success": False,
+            "error": f"Provided path is a file, not a directory: {resolved_addon}",
+        }
+
+    manifest_path = resolved_addon / "__manifest__.py"
+    if not manifest_path.is_file():
+        return {
+            "success": False,
+            "error": f"No __manifest__.py found in addon directory: {resolved_addon}",
+        }
+
+    clean_target = str(target_version).strip() or "19.0"
+    migrations_dir = resolved_addon / "migrations" / f"{clean_target}.1.0"
+
+    pre_content = _build_pre_migration_script(clean_target, column_renames, model_renames, xmlid_renames)
+    post_content = _build_post_migration_script(clean_target, selection_renames, compute_backfills)
+    readme_content = _build_migrations_readme(clean_target, resolved_addon.name)
+
+    files_plan = {
+        migrations_dir / "pre-migration.py": pre_content,
+        migrations_dir / "post-migration.py": post_content,
+        migrations_dir / "README.md": readme_content,
+    }
+
+    files_written = []
+    files_skipped = []
+    file_results = []
+
+    if not dry_run:
+        migrations_dir.mkdir(parents=True, exist_ok=True)
+        for path_obj, content in files_plan.items():
+            rel = str(path_obj.relative_to(resolved_addon))
+            if path_obj.exists() and not overwrite:
+                files_skipped.append(path_obj)
+                file_results.append({
+                    "file": rel,
+                    "status": "skipped_exists",
+                    "content": path_obj.read_text(encoding="utf-8"),
+                })
+            else:
+                path_obj.write_text(content, encoding="utf-8")
+                files_written.append(path_obj)
+                file_results.append({
+                    "file": rel,
+                    "status": "written",
+                    "content": content,
+                })
+    else:
+        for path_obj, content in files_plan.items():
+            rel = str(path_obj.relative_to(resolved_addon))
+            file_results.append({
+                "file": rel,
+                "status": "planned" if not path_obj.exists() else ("planned_overwrite" if overwrite else "skipped_exists"),
+                "content": content,
+            })
+
+    col_count = sum(len(pairs) for pairs in column_renames.values()) if (column_renames and isinstance(column_renames, dict)) else 0
+    mod_count = len(model_renames) if (model_renames and isinstance(model_renames, (list, tuple))) else 0
+    xml_count = len(xmlid_renames) if (xmlid_renames and isinstance(xmlid_renames, (list, tuple))) else 0
+    sel_count = sum(len(v) for col_map in selection_renames.values() for v in col_map.values() if isinstance(v, dict)) if (selection_renames and isinstance(selection_renames, dict)) else 0
+    comp_count = len(compute_backfills) if (compute_backfills and isinstance(compute_backfills, (list, tuple))) else 0
+
+    suggestions = []
+    if dry_run:
+        suggestions.append(
+            "Dry run complete. Review generated OpenUpgrade scripts above. To write them to disk, re-run with dry_run=False."
+        )
+    else:
+        suggestions.append(
+            f"OpenUpgrade migration scripts generated in 'migrations/{clean_target}.1.0/'."
+        )
+
+    if col_count or mod_count or xml_count:
+        suggestions.append(
+            f"Pre-migration script configured with {col_count} column, {mod_count} model, and {xml_count} XML ID rename(s)."
+        )
+
+    if sel_count or comp_count:
+        suggestions.append(
+            f"Post-migration script configured with {sel_count} selection value mapping(s) and {comp_count} compute backfill(s)."
+        )
+
+    return {
+        "success": True,
+        "addon_name": resolved_addon.name,
+        "addon_path": str(resolved_addon),
+        "target_version": clean_target,
+        "dry_run": dry_run,
+        "migrations_directory": str(migrations_dir),
+        "summary": {
+            "files_planned": len(files_plan),
+            "files_written": len(files_written),
+            "files_skipped": len(files_skipped),
+            "column_renames_count": col_count,
+            "model_renames_count": mod_count,
+            "xmlid_renames_count": xml_count,
+            "selection_renames_count": sel_count,
+            "compute_backfills_count": comp_count,
+        },
+        "files": file_results,
+        "suggestions": suggestions,
+    }
 
 
 KNOWN_ENTERPRISE_MODULES = {
@@ -2817,6 +3121,11 @@ def migrate_odoo_addon(
     target_version: str = "19.0",
     dry_run: bool = True,
     scaffold_openupgrade: bool = True,
+    column_renames: dict | None = None,
+    model_renames: list | None = None,
+    xmlid_renames: list | None = None,
+    selection_renames: dict | None = None,
+    compute_backfills: list | None = None,
 ) -> dict:
     """Migrate a custom Odoo addon from Odoo 16/17/18 to Odoo 19 (Community & Enterprise).
 
@@ -2833,6 +3142,11 @@ def migrate_odoo_addon(
             If False, saves an automatic timestamped backup and applies all changes.
         scaffold_openupgrade: If True, scaffolds standard migrations/19.0.1.0/
             OpenUpgrade pre-migration and post-migration templates.
+        column_renames: Optional dict of table to list of (old_col, new_col) tuples.
+        model_renames: Optional list of (old_model, new_model) tuples.
+        xmlid_renames: Optional list of (old_xml_id, new_xml_id) tuples.
+        selection_renames: Optional dict of table to {column: {old_val: new_val}}.
+        compute_backfills: Optional list of dicts with model and field.
     """
     if not isinstance(addon_path, str) or not addon_path.strip():
         return {
@@ -3090,20 +3404,20 @@ def migrate_odoo_addon(
             migrations_dir.mkdir(parents=True, exist_ok=True)
             pre_file = migrations_dir / "pre-migration.py"
             if not pre_file.exists():
-                pre_file.write_text(PRE_MIGRATION_TEMPLATE.replace("{target_version}", clean_target), encoding="utf-8")
+                pre_content = _build_pre_migration_script(clean_target, column_renames, model_renames, xmlid_renames)
+                pre_file.write_text(pre_content, encoding="utf-8")
                 scaffold_created = True
 
             post_file = migrations_dir / "post-migration.py"
             if not post_file.exists():
-                post_file.write_text(POST_MIGRATION_TEMPLATE.replace("{target_version}", clean_target), encoding="utf-8")
+                post_content = _build_post_migration_script(clean_target, selection_renames, compute_backfills)
+                post_file.write_text(post_content, encoding="utf-8")
                 scaffold_created = True
 
             readme_file = migrations_dir / "README.md"
             if not readme_file.exists():
-                readme_file.write_text(
-                    MIGRATIONS_README_TEMPLATE.replace("{target_version}", clean_target).replace("{addon_name}", resolved_addon.name),
-                    encoding="utf-8",
-                )
+                readme_content = _build_migrations_readme(clean_target, resolved_addon.name)
+                readme_file.write_text(readme_content, encoding="utf-8")
                 scaffold_created = True
     else:
         scaffold_created = len(openupgrade_files_planned) > 0

@@ -9,6 +9,7 @@ from server import (
     analyze_odoo_security,
     analyze_odoo_xml_view,
     check_odoo_addon_health,
+    generate_openupgrade_scripts,
     inspect_odoo_module,
     main,
     migrate_odoo_addon,
@@ -2346,3 +2347,192 @@ def test_analyze_owl_component_file_size_and_empty(tmp_path: Path):
     res_large = analyze_odoo_owl_component(str(large_js))
     assert res_large["success"] is False
     assert "File is too large to inspect" in res_large["error"]
+
+
+# --------------------------------------------------
+# Tests for generate_openupgrade_scripts
+# --------------------------------------------------
+
+def test_generate_openupgrade_scripts_invalid_path(tmp_path: Path):
+    res_empty = generate_openupgrade_scripts("")
+    assert res_empty["success"] is False
+    assert "Please provide an addon directory path" in res_empty["error"]
+
+    res_nonexistent = generate_openupgrade_scripts(str(tmp_path / "does_not_exist"))
+    assert res_nonexistent["success"] is False
+    assert "does not exist" in res_nonexistent["error"]
+
+    file_path = tmp_path / "some_file.txt"
+    file_path.write_text("hello", encoding="utf-8")
+    res_file = generate_openupgrade_scripts(str(file_path))
+    assert res_file["success"] is False
+    assert "Provided path is a file" in res_file["error"]
+
+    addon_no_manifest = tmp_path / "no_manifest"
+    addon_no_manifest.mkdir()
+    res_no_manifest = generate_openupgrade_scripts(str(addon_no_manifest))
+    assert res_no_manifest["success"] is False
+    assert "No __manifest__.py found" in res_no_manifest["error"]
+
+
+def test_generate_openupgrade_scripts_dry_run_previews_code(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Module", "version": "18.0.1.0.0"})
+    res = generate_openupgrade_scripts(str(addon), target_version="19.0", dry_run=True)
+
+    assert res["success"] is True
+    assert res["dry_run"] is True
+    assert res["summary"]["files_planned"] == 3
+    assert res["summary"]["files_written"] == 0
+    assert not (addon / "migrations").exists()
+
+    file_map = {f["file"]: f["content"] for f in res["files"]}
+    assert "migrations/19.0.1.0/pre-migration.py" in file_map
+    assert "migrations/19.0.1.0/post-migration.py" in file_map
+    assert "migrations/19.0.1.0/README.md" in file_map
+    assert "openupgradelib" in file_map["migrations/19.0.1.0/pre-migration.py"]
+
+
+def test_generate_openupgrade_scripts_creates_column_and_model_renames(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Module", "version": "18.0.1.0.0"})
+    col_renames = {
+        "sale_order": [("client_order_ref", "customer_reference")],
+        "res_partner": [("old_fax", "new_fax")],
+    }
+    model_renames = [("old.sales.lead", "crm.lead"), ("custom.partner", "res.partner")]
+
+    res = generate_openupgrade_scripts(
+        str(addon),
+        target_version="19.0",
+        column_renames=col_renames,
+        model_renames=model_renames,
+        dry_run=False,
+    )
+
+    assert res["success"] is True
+    assert res["summary"]["files_written"] == 3
+    assert res["summary"]["column_renames_count"] == 2
+    assert res["summary"]["model_renames_count"] == 2
+
+    pre_file = addon / "migrations" / "19.0.1.0" / "pre-migration.py"
+    assert pre_file.exists()
+    content = pre_file.read_text(encoding="utf-8")
+
+    assert "COLUMN_RENAMES = {" in content
+    assert '"sale_order": [' in content
+    assert '("client_order_ref", "customer_reference")' in content
+    assert "MODEL_RENAMES = [" in content
+    assert '("old.sales.lead", "crm.lead")' in content
+    assert "openupgrade.rename_columns(env.cr, COLUMN_RENAMES)" in content
+    assert "openupgrade.rename_models(env.cr, MODEL_RENAMES)" in content
+
+
+def test_generate_openupgrade_scripts_creates_xmlid_renames(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Module", "version": "18.0.1.0.0"})
+    xmlids = [
+        ("my_module.old_view_tree", "my_module.old_view_list"),
+        ("my_module.action_window_old", "my_module.action_window_new"),
+    ]
+
+    res = generate_openupgrade_scripts(
+        str(addon),
+        target_version="19.0",
+        xmlid_renames=xmlids,
+        dry_run=False,
+    )
+
+    assert res["success"] is True
+    assert res["summary"]["xmlid_renames_count"] == 2
+
+    pre_file = addon / "migrations" / "19.0.1.0" / "pre-migration.py"
+    content = pre_file.read_text(encoding="utf-8")
+    assert "XMLID_RENAMES = [" in content
+    assert '("my_module.old_view_tree", "my_module.old_view_list")' in content
+    assert "openupgrade.rename_xmlids(env.cr, XMLID_RENAMES)" in content
+
+
+def test_generate_openupgrade_scripts_creates_selection_and_compute_backfills(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Module", "version": "18.0.1.0.0"})
+    selection_map = {
+        "sale_order": {
+            "state": {"draft": "quotation", "sent": "quotation_sent"}
+        }
+    }
+    compute_backfills = [
+        {"model": "sale.order", "field": "amount_tax"},
+        {"model": "res.partner", "field": "display_name"},
+    ]
+
+    res = generate_openupgrade_scripts(
+        str(addon),
+        target_version="19.0",
+        selection_renames=selection_map,
+        compute_backfills=compute_backfills,
+        dry_run=False,
+    )
+
+    assert res["success"] is True
+    assert res["summary"]["selection_renames_count"] == 2
+    assert res["summary"]["compute_backfills_count"] == 2
+
+    post_file = addon / "migrations" / "19.0.1.0" / "post-migration.py"
+    assert post_file.exists()
+    content = post_file.read_text(encoding="utf-8")
+
+    assert 'UPDATE sale_order SET state = %s WHERE state = %s", (\'quotation\', \'draft\')' in content
+    assert 'UPDATE sale_order SET state = %s WHERE state = %s", (\'quotation_sent\', \'sent\')' in content
+    assert 'env["sale.order"].search([("amount_tax", "=", False)])' in content
+    assert "records._compute_amount_tax()" in content
+    assert 'env["res.partner"].search([("display_name", "=", False)])' in content
+    assert "records._compute_display_name()" in content
+
+
+def test_generate_openupgrade_scripts_overwrite_protection(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Module", "version": "18.0.1.0.0"})
+    mig_dir = addon / "migrations" / "19.0.1.0"
+    mig_dir.mkdir(parents=True)
+    custom_pre = mig_dir / "pre-migration.py"
+    custom_pre.write_text("# CUSTOM PRE SCRIPT", encoding="utf-8")
+
+    # Dry run with overwrite=False
+    res_dry = generate_openupgrade_scripts(str(addon), target_version="19.0", dry_run=True, overwrite=False)
+    assert res_dry["success"] is True
+    pre_stat = next(f for f in res_dry["files"] if "pre-migration.py" in f["file"])
+    assert pre_stat["status"] == "skipped_exists"
+
+    # Actual run with overwrite=False
+    res_no_over = generate_openupgrade_scripts(str(addon), target_version="19.0", dry_run=False, overwrite=False)
+    assert res_no_over["success"] is True
+    assert res_no_over["summary"]["files_skipped"] == 1
+    assert custom_pre.read_text(encoding="utf-8") == "# CUSTOM PRE SCRIPT"
+
+    # Actual run with overwrite=True
+    res_over = generate_openupgrade_scripts(str(addon), target_version="19.0", dry_run=False, overwrite=True)
+    assert res_over["success"] is True
+    assert res_over["summary"]["files_written"] == 3
+    assert custom_pre.read_text(encoding="utf-8") != "# CUSTOM PRE SCRIPT"
+
+
+def test_migrate_addon_with_custom_openupgrade_renames(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Module", "version": "18.0.1.0.0"})
+    col_renames = {"project_task": [("old_status", "stage_id")]}
+    compute_backfills = [{"model": "project.task", "field": "effective_hours"}]
+
+    res = migrate_odoo_addon(
+        str(addon),
+        target_version="19.0",
+        dry_run=False,
+        scaffold_openupgrade=True,
+        column_renames=col_renames,
+        compute_backfills=compute_backfills,
+    )
+
+    assert res["success"] is True
+    assert res["summary"]["openupgrade_scaffolded"] is True
+
+    pre_file = addon / "migrations" / "19.0.1.0" / "pre-migration.py"
+    assert pre_file.exists()
+    assert '("old_status", "stage_id")' in pre_file.read_text(encoding="utf-8")
+
+    post_file = addon / "migrations" / "19.0.1.0" / "post-migration.py"
+    assert post_file.exists()
+    assert 'env["project.task"].search([("effective_hours", "=", False)])' in post_file.read_text(encoding="utf-8")
