@@ -13,6 +13,7 @@ from server import (
     inspect_odoo_module,
     main,
     migrate_odoo_addon,
+    scaffold_odoo_tests,
     validate_odoo_manifest,
     verify_odoo_live_metadata,
 )
@@ -2536,3 +2537,241 @@ def test_migrate_addon_with_custom_openupgrade_renames(tmp_path: Path):
     post_file = addon / "migrations" / "19.0.1.0" / "post-migration.py"
     assert post_file.exists()
     assert 'env["project.task"].search([("effective_hours", "=", False)])' in post_file.read_text(encoding="utf-8")
+
+
+# --------------------------------------------------
+# Tests for scaffold_odoo_tests
+# --------------------------------------------------
+
+def test_scaffold_odoo_tests_invalid_path(tmp_path: Path):
+    res_empty = scaffold_odoo_tests("")
+    assert res_empty["success"] is False
+    assert "Please provide an addon directory path" in res_empty["error"]
+
+    res_nonexistent = scaffold_odoo_tests(str(tmp_path / "does_not_exist"))
+    assert res_nonexistent["success"] is False
+    assert "does not exist" in res_nonexistent["error"]
+
+    file_path = tmp_path / "regular_file.txt"
+    file_path.write_text("dummy", encoding="utf-8")
+    res_file = scaffold_odoo_tests(str(file_path))
+    assert res_file["success"] is False
+    assert "Provided path is a file" in res_file["error"]
+
+    no_manifest = tmp_path / "no_manifest_addon"
+    no_manifest.mkdir()
+    res_no_manifest = scaffold_odoo_tests(str(no_manifest))
+    assert res_no_manifest["success"] is False
+    assert "No __manifest__.py found" in res_no_manifest["error"]
+
+
+def test_scaffold_odoo_tests_dry_run_previews_code(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Dry Run", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "custom_item.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class CustomItem(models.Model):\n"
+        "    _name = 'custom.item'\n"
+        "    _description = 'Custom Item'\n"
+        "    name = fields.Char(string='Name', required=True)\n",
+        encoding="utf-8",
+    )
+
+    res = scaffold_odoo_tests(str(addon), dry_run=True)
+    assert res["success"] is True
+    assert res["dry_run"] is True
+    assert res["summary"]["files_planned"] == 2
+    assert res["summary"]["files_written"] == 0
+    assert res["summary"]["models_covered"] == 1
+    assert not (addon / "tests").exists()
+
+    file_map = {f["file"]: f["content"] for f in res["files"]}
+    assert "tests/__init__.py" in file_map
+    assert "tests/test_custom_item.py" in file_map
+    assert "TestCustomItem(TransactionCase)" in file_map["tests/test_custom_item.py"]
+
+
+def test_scaffold_odoo_tests_scaffolds_model_crud_and_fields(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test CRUD", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "order.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class SaleCustomOrder(models.Model):\n"
+        "    _name = 'sale.custom.order'\n"
+        "    _description = 'Sales Custom Order'\n"
+        "    name = fields.Char(string='Order Ref', required=True)\n"
+        "    priority = fields.Integer(string='Priority', required=True)\n"
+        "    is_urgent = fields.Boolean(string='Urgent', required=True)\n",
+        encoding="utf-8",
+    )
+
+    res = scaffold_odoo_tests(str(addon), dry_run=False)
+    assert res["success"] is True
+    assert res["summary"]["files_written"] == 2
+    assert (addon / "tests" / "__init__.py").exists()
+    test_file = addon / "tests" / "test_sale_custom_order.py"
+    assert test_file.exists()
+
+    content = test_file.read_text(encoding="utf-8")
+    assert "class TestSaleCustomOrder(TransactionCase):" in content
+    assert 'cls.record = cls.env["sale.custom.order"].create({' in content
+    assert '"priority": 10,' in content
+    assert '"is_urgent": True,' in content
+    assert "def test_record_creation(self):" in content
+    assert "def test_record_write(self):" in content
+    assert "def test_record_unlink(self):" in content
+    assert 'self.assertTrue(self.record.id' in content
+
+
+def test_scaffold_odoo_tests_generates_constraints_and_actions(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Logic", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "subscription.py").write_text(
+        "from odoo import models, fields, api\n"
+        "from odoo.exceptions import ValidationError\n\n"
+        "class Subscription(models.Model):\n"
+        "    _name = 'custom.subscription'\n"
+        "    _description = 'Subscription'\n"
+        "    name = fields.Char(string='Title')\n"
+        "    amount = fields.Float(string='Amount')\n\n"
+        "    @api.constrains('amount')\n"
+        "    def _check_amount(self):\n"
+        "        for record in self:\n"
+        "            if record.amount < 0:\n"
+        "                raise ValidationError('Amount must be positive.')\n\n"
+        "    def action_activate(self):\n"
+        "        return True\n\n"
+        "    def _compute_total(self):\n"
+        "        pass\n",
+        encoding="utf-8",
+    )
+
+    res = scaffold_odoo_tests(str(addon), dry_run=False)
+    assert res["success"] is True
+    test_file = addon / "tests" / "test_custom_subscription.py"
+    content = test_file.read_text(encoding="utf-8")
+
+    assert "def test_constraint__check_amount(self):" in content
+    assert "with self.assertRaises(ValidationError):" in content
+    assert "def test_action_activate(self):" in content
+    assert "res = self.record.action_activate()" in content
+    assert "def test__compute_total(self):" in content
+
+
+def test_scaffold_odoo_tests_generates_access_rights_from_security(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Sec", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "lead.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class CrmLeadCustom(models.Model):\n"
+        "    _name = 'crm.lead.custom'\n"
+        "    _description = 'CRM Lead'\n"
+        "    name = fields.Char()\n",
+        encoding="utf-8",
+    )
+    sec_dir = addon / "security"
+    sec_dir.mkdir()
+    (sec_dir / "ir.model.access.csv").write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_crm_lead_custom_user,crm.lead.custom.user,model_crm_lead_custom,base.group_user,1,1,1,0\n",
+        encoding="utf-8",
+    )
+
+    res = scaffold_odoo_tests(str(addon), test_type="all", dry_run=False)
+    assert res["success"] is True
+    test_file = addon / "tests" / "test_crm_lead_custom.py"
+    content = test_file.read_text(encoding="utf-8")
+    assert "def test_access_rights(self):" in content
+    assert 'self.assertTrue(self.env["crm.lead.custom"].check_access_rights("read", raise_exception=False))' in content
+
+
+def test_scaffold_odoo_tests_maintains_init_file(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Init", "version": "18.0.1.0.0"})
+    tests_dir = addon / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "__init__.py").write_text("# Custom Init\nfrom . import test_existing\n", encoding="utf-8")
+
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "new_model.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class NewModel(models.Model):\n"
+        "    _name = 'new.model'\n"
+        "    _description = 'New Model'\n",
+        encoding="utf-8",
+    )
+
+    res = scaffold_odoo_tests(str(addon), dry_run=False)
+    assert res["success"] is True
+
+    init_content = (tests_dir / "__init__.py").read_text(encoding="utf-8")
+    assert "from . import test_existing" in init_content
+    assert "from . import test_new_model" in init_content
+
+
+def test_scaffold_odoo_tests_overwrite_protection(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Overwrite", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "item.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class Item(models.Model):\n"
+        "    _name = 'test.item'\n"
+        "    _description = 'Item'\n",
+        encoding="utf-8",
+    )
+
+    tests_dir = addon / "tests"
+    tests_dir.mkdir()
+    custom_test = tests_dir / "test_test_item.py"
+    custom_test.write_text("# MY CUSTOM TEST CODE", encoding="utf-8")
+
+    # dry_run=False, overwrite=False
+    res_no_over = scaffold_odoo_tests(str(addon), dry_run=False, overwrite=False)
+    assert res_no_over["success"] is True
+    assert res_no_over["summary"]["files_skipped"] == 1
+    assert custom_test.read_text(encoding="utf-8") == "# MY CUSTOM TEST CODE"
+
+    # dry_run=False, overwrite=True
+    res_over = scaffold_odoo_tests(str(addon), dry_run=False, overwrite=True)
+    assert res_over["success"] is True
+    assert res_over["summary"]["files_written"] == 2
+    assert custom_test.read_text(encoding="utf-8") != "# MY CUSTOM TEST CODE"
+
+
+def test_scaffold_odoo_tests_filter_specific_models(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test Filter", "version": "18.0.1.0.0"})
+    models_dir = addon / "models"
+    models_dir.mkdir()
+    (models_dir / "models.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class ModelA(models.Model):\n"
+        "    _name = 'model.a'\n"
+        "    _description = 'Model A'\n\n"
+        "class ModelB(models.Model):\n"
+        "    _name = 'model.b'\n"
+        "    _description = 'Model B'\n",
+        encoding="utf-8",
+    )
+
+    res = scaffold_odoo_tests(str(addon), models=["model.a"], dry_run=False)
+    assert res["success"] is True
+    assert res["summary"]["models_covered"] == 1
+    assert (addon / "tests" / "test_model_a.py").exists()
+    assert not (addon / "tests" / "test_model_b.py").exists()
+
+
+def test_scaffold_odoo_tests_fallback_install_test(tmp_path: Path):
+    addon = create_addon(tmp_path, {"name": "Test No Models", "version": "18.0.1.0.0"})
+    res = scaffold_odoo_tests(str(addon), dry_run=False)
+    assert res["success"] is True
+    assert res["summary"]["models_covered"] == 0
+    install_test = addon / "tests" / "test_module_install.py"
+    assert install_test.exists()
+    content = install_test.read_text(encoding="utf-8")
+    assert "class TestModuleInstall(TransactionCase):" in content
+    assert 'ir.module.module' in content

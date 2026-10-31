@@ -3913,8 +3913,522 @@ def analyze_odoo_owl_component(
     }
 
 
+def _extract_addon_models_for_testing(addon_path: Path) -> list[dict]:
+    """Extract model, field, constraint, action, and compute definitions from an addon for test generation."""
+    models_found = []
+    py_files = sorted(addon_path.glob("**/*.py"))
+
+    for py_file in py_files:
+        if (
+            py_file.name.startswith(".")
+            or "tests" in py_file.parts
+            or "migrations" in py_file.parts
+            or "_migration_backups" in py_file.parts
+            or py_file.name in ("__manifest__.py", "__init__.py")
+        ):
+            continue
+
+        try:
+            content = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(content, filename=str(py_file))
+        except Exception:
+            continue
+
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not _is_odoo_model_class(node):
+                continue
+
+            class_name = node.name
+            model_name = None
+            class_fields = []
+            constrains = []
+            actions = []
+            computes = []
+
+            for stmt in node.body:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            if target.id == "_name" and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                                model_name = stmt.value.value
+                            elif target.id == "_inherit" and not model_name and isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                                model_name = stmt.value.value
+
+                        if isinstance(target, ast.Name) and not target.id.startswith("_") and isinstance(stmt.value, ast.Call):
+                            func = stmt.value.func
+                            field_type = None
+                            if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name) and func.value.id == "fields":
+                                field_type = func.attr
+                            elif isinstance(func, ast.Name):
+                                field_type = func.id
+
+                            if field_type:
+                                is_required = False
+                                comp_attr = None
+                                for kw in stmt.value.keywords:
+                                    if kw.arg == "required" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                                        is_required = True
+                                    elif kw.arg == "compute" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                                        comp_attr = kw.value.value
+                                class_fields.append({
+                                    "name": target.id,
+                                    "type": field_type,
+                                    "required": is_required,
+                                    "compute": comp_attr,
+                                })
+
+                elif isinstance(stmt, ast.FunctionDef):
+                    fn_name = stmt.name
+                    if fn_name.startswith("action_"):
+                        actions.append(fn_name)
+                    elif fn_name.startswith("_compute_"):
+                        computes.append(fn_name)
+
+                    for dec in stmt.decorator_list:
+                        is_constrains = False
+                        if isinstance(dec, ast.Call):
+                            if isinstance(dec.func, ast.Attribute) and dec.func.attr == "constrains":
+                                is_constrains = True
+                            elif isinstance(dec.func, ast.Name) and dec.func.id == "constrains":
+                                is_constrains = True
+                            if is_constrains:
+                                c_fields = [
+                                    arg.value for arg in dec.args
+                                    if isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                                ]
+                                constrains.append({"method": fn_name, "fields": c_fields})
+
+            if model_name:
+                models_found.append({
+                    "class_name": class_name,
+                    "model_name": model_name,
+                    "fields": class_fields,
+                    "constrains": constrains,
+                    "actions": actions,
+                    "computes": computes,
+                    "file": str(py_file.relative_to(addon_path)),
+                })
+
+    return models_found
+
+
+def _extract_addon_security_rules(addon_path: Path) -> dict[str, list[dict]]:
+    """Parse security/ir.model.access.csv to extract security groups by model."""
+    rules_by_model = {}
+    sec_csv = addon_path / "security" / "ir.model.access.csv"
+    if not sec_csv.is_file():
+        return rules_by_model
+
+    try:
+        text = sec_csv.read_text(encoding="utf-8")
+        reader = csv.reader(text.splitlines())
+        rows = [r for r in reader if r and not r[0].strip().startswith("#")]
+        if not rows:
+            return rules_by_model
+        header = [h.strip() for h in rows[0]]
+        if "model_id:id" not in header:
+            return rules_by_model
+
+        model_idx = header.index("model_id:id")
+        group_idx = header.index("group_id:id") if "group_id:id" in header else -1
+        read_idx = header.index("perm_read") if "perm_read" in header else -1
+        write_idx = header.index("perm_write") if "perm_write" in header else -1
+
+        for row in rows[1:]:
+            if len(row) <= model_idx:
+                continue
+            m_raw = row[model_idx].strip()
+            m_name = m_raw[6:] if m_raw.startswith("model_") else m_raw
+            m_dotted = m_name.replace("_", ".")
+            group = row[group_idx].strip() if group_idx >= 0 and len(row) > group_idx else ""
+            entry = {
+                "group": group,
+                "read": row[read_idx].strip() == "1" if read_idx >= 0 and len(row) > read_idx else False,
+                "write": row[write_idx].strip() == "1" if write_idx >= 0 and len(row) > write_idx else False,
+            }
+            rules_by_model.setdefault(m_dotted, []).append(entry)
+            rules_by_model.setdefault(m_name, []).append(entry)
+    except Exception:
+        pass
+
+    return rules_by_model
+
+
+def _build_model_test_code(
+    model_info: dict,
+    security_rules: list[dict] | None,
+    addon_name: str,
+    test_type: str = "all",
+) -> str:
+    """Generate production-ready Odoo TransactionCase unit test file content for a model."""
+    class_name = model_info["class_name"]
+    model_name = model_info["model_name"]
+    fields = model_info.get("fields", [])
+    constrains = model_info.get("constrains", [])
+    actions = model_info.get("actions", [])
+    computes = model_info.get("computes", [])
+
+    sample_dict = {}
+    has_name = any(f["name"] == "name" for f in fields)
+    if has_name:
+        sample_dict["name"] = f"Test {class_name}"
+
+    for f in fields:
+        fname = f["name"]
+        ftype = f["type"]
+        if fname in sample_dict:
+            continue
+        if f.get("required"):
+            if ftype in ("Char", "Text", "Html"):
+                sample_dict[fname] = f"Test {fname}"
+            elif ftype == "Integer":
+                sample_dict[fname] = 10
+            elif ftype == "Float":
+                sample_dict[fname] = 10.0
+            elif ftype == "Boolean":
+                sample_dict[fname] = True
+            elif ftype == "Date":
+                sample_dict[fname] = "2026-01-01"
+            elif ftype == "Datetime":
+                sample_dict[fname] = "2026-01-01 12:00:00"
+            elif ftype == "Selection":
+                sample_dict[fname] = "draft"
+
+    if not sample_dict:
+        sample_dict["name"] = f"Test {class_name}"
+
+    field_setup_lines = []
+    for k, v in sample_dict.items():
+        if isinstance(v, str):
+            field_setup_lines.append(f'            "{k}": "{v}",')
+        elif isinstance(v, bool):
+            field_setup_lines.append(f'            "{k}": {v},')
+        else:
+            field_setup_lines.append(f'            "{k}": {v},')
+
+    lines = [
+        "# -*- coding: utf-8 -*-",
+        "from odoo.tests.common import TransactionCase, tagged",
+        "from odoo.exceptions import ValidationError, AccessError, UserError",
+        "",
+        "",
+        '@tagged("post_install", "-at_install")',
+        f"class Test{class_name}(TransactionCase):",
+        f'    """Automated test suite for model {model_name}."""',
+        "",
+        "    @classmethod",
+        "    def setUpClass(cls):",
+        "        super().setUpClass()",
+        f'        cls.record = cls.env["{model_name}"].create({{',
+    ]
+    lines.extend(field_setup_lines)
+    lines.extend([
+        "        })",
+        "",
+        "    def test_record_creation(self):",
+        '        """Test successful creation and initial field attributes."""',
+        '        self.assertTrue(self.record.id, "Record should have been assigned a database ID.")',
+    ])
+
+    for k in list(sample_dict.keys())[:3]:
+        val = sample_dict[k]
+        if isinstance(val, str):
+            lines.append(f'        self.assertEqual(self.record.{k}, "{val}")')
+        elif isinstance(val, bool):
+            lines.append(f"        self.assertEqual(self.record.{k}, {val})")
+
+    lines.extend([
+        "",
+        "    def test_record_write(self):",
+        '        """Test updating record field values."""',
+    ])
+    if "name" in sample_dict:
+        lines.extend([
+            '        self.record.write({"name": "Updated Record"})',
+            '        self.assertEqual(self.record.name, "Updated Record")',
+        ])
+    else:
+        first_key = list(sample_dict.keys())[0]
+        lines.extend([
+            f'        self.record.write({{"{first_key}": self.record.{first_key}}})',
+            f'        self.assertTrue(self.record.{first_key})',
+        ])
+
+    lines.extend([
+        "",
+        "    def test_record_unlink(self):",
+        '        """Test deleting a record and verify it no longer exists."""',
+        f'        rec = self.env["{model_name}"].create({{',
+    ])
+    lines.extend(field_setup_lines)
+    lines.extend([
+        "        })",
+        "        rec_id = rec.id",
+        "        rec.unlink()",
+        f'        self.assertFalse(self.env["{model_name}"].browse(rec_id).exists())',
+    ])
+
+    if test_type in ("all", "unit"):
+        for c in constrains:
+            mname = c["method"]
+            c_fields = c["fields"]
+            lines.extend([
+                "",
+                f"    def test_constraint_{mname}(self):",
+                f'        """Verify @api.constrains {mname} raises ValidationError on invalid data."""',
+                "        with self.assertRaises(ValidationError):",
+            ])
+            if c_fields:
+                cf = c_fields[0]
+                lines.append(f'            self.record.write({{"{cf}": False}})')
+            else:
+                lines.append('            self.record.write({"name": ""})')
+
+        for action in actions:
+            lines.extend([
+                "",
+                f"    def test_{action}(self):",
+                f'        """Verify execution of action method {action}."""',
+                f"        res = self.record.{action}()",
+                "        self.assertTrue(res is None or isinstance(res, (dict, bool)))",
+            ])
+
+        for comp in computes:
+            lines.extend([
+                "",
+                f"    def test_{comp}(self):",
+                f'        """Verify computed method {comp} executes cleanly."""',
+                f"        self.record.{comp}()",
+                "        self.assertTrue(self.record.id)",
+            ])
+
+    if (test_type in ("all", "access_rights")) and security_rules:
+        lines.extend([
+            "",
+            "    def test_access_rights(self):",
+            '        """Verify model security read access."""',
+            f'        self.assertTrue(self.env["{model_name}"].check_access_rights("read", raise_exception=False))',
+        ])
+
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_module_install_test_code(addon_name: str) -> str:
+    """Generate baseline module installation verification test."""
+    return f"""# -*- coding: utf-8 -*-
+from odoo.tests.common import TransactionCase, tagged
+
+
+@tagged("post_install", "-at_install")
+class TestModuleInstall(TransactionCase):
+    \"\"\"Verify clean module installation and dependencies.\"\"\"
+
+    def test_module_installed(self):
+        module = self.env["ir.module.module"].search([("name", "=", "{addon_name}")])
+        self.assertTrue(module.exists(), "Module {addon_name} should exist in ir.module.module.")
+        self.assertEqual(module.state, "installed", "Module {addon_name} should be installed.")
+"""
+
+
+def _build_tests_init_code(existing_init: str | None, module_names: list[str]) -> str:
+    """Generate or update tests/__init__.py with test imports."""
+    existing_lines = []
+    existing_modules = set()
+    if existing_init:
+        existing_lines = existing_init.splitlines()
+        for line in existing_lines:
+            stripped = line.strip()
+            if stripped.startswith("from . import"):
+                parts = stripped.replace("from . import", "").split(",")
+                for p in parts:
+                    existing_modules.add(p.strip())
+
+    new_imports = [f"from . import {m}" for m in module_names if m not in existing_modules]
+
+    if not existing_lines:
+        lines = ["# -*- coding: utf-8 -*-", ""]
+        lines.extend(new_imports)
+        return "\n".join(lines).strip() + "\n"
+
+    result = list(existing_lines)
+    for imp in new_imports:
+        result.append(imp)
+    return "\n".join(result).strip() + "\n"
+
+
+@mcp.tool()
+def scaffold_odoo_tests(
+    addon_path: str,
+    test_type: str = "all",
+    models: list[str] | None = None,
+    dry_run: bool = True,
+    overwrite: bool = False,
+) -> dict:
+    """Scaffold comprehensive, production-ready Odoo automated test suites (tests/test_*.py
+    and tests/__init__.py) tailored directly to an addon's Python models, fields, constraints,
+    actions, and security access rules.
+
+    Args:
+        addon_path: Path to the Odoo addon directory.
+        test_type: Test type to scaffold: 'all', 'unit', or 'access_rights' (default: 'all').
+        models: Optional list of model technical names (e.g. ['sale.order']) to restrict test scaffolding.
+        dry_run: If True, previews generated test suites without writing files to disk.
+        overwrite: If True, overwrites existing test files in tests/.
+    """
+    if not isinstance(addon_path, str) or not addon_path.strip():
+        return {
+            "success": False,
+            "error": "Please provide an addon directory path as text.",
+        }
+
+    try:
+        resolved_addon = Path(addon_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid addon path: {exc}",
+        }
+
+    if not resolved_addon.exists():
+        return {
+            "success": False,
+            "error": f"Addon directory does not exist: {resolved_addon}",
+        }
+
+    if not resolved_addon.is_dir():
+        return {
+            "success": False,
+            "error": f"Provided path is a file, not a directory: {resolved_addon}",
+        }
+
+    manifest_path = resolved_addon / "__manifest__.py"
+    if not manifest_path.is_file():
+        return {
+            "success": False,
+            "error": f"No __manifest__.py found in addon directory: {resolved_addon}",
+        }
+
+    clean_test_type = str(test_type).strip().lower()
+    if clean_test_type not in ("all", "unit", "access_rights"):
+        clean_test_type = "all"
+
+    all_models = _extract_addon_models_for_testing(resolved_addon)
+    security_rules = _extract_addon_security_rules(resolved_addon)
+
+    if models and isinstance(models, (list, tuple)):
+        model_filter = set(str(m).strip() for m in models if str(m).strip())
+        target_models = [m for m in all_models if m["model_name"] in model_filter]
+    else:
+        target_models = all_models
+
+    tests_dir = resolved_addon / "tests"
+    init_path = tests_dir / "__init__.py"
+    files_plan = {}
+    test_module_names = []
+    tests_scaffolded_count = 0
+
+    if target_models:
+        for m in target_models:
+            clean_m_name = re.sub(r"[^a-zA-Z0-9]+", "_", m["model_name"]).strip("_").lower()
+            mod_name = f"test_{clean_m_name}"
+            test_module_names.append(mod_name)
+            file_path = tests_dir / f"{mod_name}.py"
+            m_sec = security_rules.get(m["model_name"])
+            code = _build_model_test_code(m, m_sec, resolved_addon.name, test_type=clean_test_type)
+            files_plan[file_path] = code
+            # Rough estimate of tests generated
+            tests_scaffolded_count += 3  # creation, write, unlink
+            tests_scaffolded_count += len(m.get("constrains", []))
+            tests_scaffolded_count += len(m.get("actions", []))
+            tests_scaffolded_count += len(m.get("computes", []))
+            if m_sec and clean_test_type in ("all", "access_rights"):
+                tests_scaffolded_count += 1
+    else:
+        # Fallback to module installation test
+        mod_name = "test_module_install"
+        test_module_names.append(mod_name)
+        file_path = tests_dir / f"{mod_name}.py"
+        files_plan[file_path] = _build_module_install_test_code(resolved_addon.name)
+        tests_scaffolded_count += 1
+
+    existing_init_text = None
+    if init_path.is_file():
+        try:
+            existing_init_text = init_path.read_text(encoding="utf-8")
+        except Exception:
+            pass
+
+    init_code = _build_tests_init_code(existing_init_text, test_module_names)
+    files_plan[init_path] = init_code
+
+    files_written = []
+    files_skipped = []
+    file_results = []
+
+    if not dry_run:
+        tests_dir.mkdir(parents=True, exist_ok=True)
+        for p_obj, content in files_plan.items():
+            rel = str(p_obj.relative_to(resolved_addon))
+            if p_obj.exists() and not overwrite and p_obj != init_path:
+                files_skipped.append(p_obj)
+                file_results.append({
+                    "file": rel,
+                    "status": "skipped_exists",
+                    "content": p_obj.read_text(encoding="utf-8"),
+                })
+            else:
+                p_obj.write_text(content, encoding="utf-8")
+                files_written.append(p_obj)
+                file_results.append({
+                    "file": rel,
+                    "status": "written",
+                    "content": content,
+                })
+    else:
+        for p_obj, content in files_plan.items():
+            rel = str(p_obj.relative_to(resolved_addon))
+            file_results.append({
+                "file": rel,
+                "status": "planned" if not p_obj.exists() else ("planned_overwrite" if overwrite else "skipped_exists"),
+                "content": content,
+            })
+
+    suggestions = []
+    if dry_run:
+        suggestions.append(
+            "Dry run complete. Review generated test suites above. To scaffold files to disk, run with dry_run=False."
+        )
+    else:
+        suggestions.append(
+            f"Automated test suites created under '{resolved_addon.name}/tests/'."
+        )
+
+    suggestions.append(
+        f"Run tests in Odoo with CLI: odoo-bin -c odoo.conf -i {resolved_addon.name} --test-enable --test-tags /{resolved_addon.name} --stop-after-init"
+    )
+
+    return {
+        "success": True,
+        "addon_name": resolved_addon.name,
+        "addon_path": str(resolved_addon),
+        "test_type": clean_test_type,
+        "dry_run": dry_run,
+        "tests_directory": str(tests_dir),
+        "summary": {
+            "files_planned": len(files_plan),
+            "files_written": len(files_written),
+            "files_skipped": len(files_skipped),
+            "models_covered": len(target_models),
+            "tests_scaffolded": tests_scaffolded_count,
+        },
+        "files": file_results,
+        "suggestions": suggestions,
+    }
+
+
 def main() -> None:
     mcp.run()
+
 
 
 if __name__ == "__main__":

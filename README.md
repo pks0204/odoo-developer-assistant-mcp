@@ -158,6 +158,17 @@ Capabilities include:
 - **Post-Migration Compute Field Backfills**: Produces batch ORM search and recompute code (`records._compute_<field>()`) to backfill new stored computed fields for historical records.
 - **Safety & Idempotency**: Defaults to `dry_run=True` to preview generated Python code without touching disk; provides `overwrite=False` safeguards to protect existing manual migration scripts from accidental overwrite.
 
+### 12. Automated Odoo Test Scaffolder
+
+The `scaffold_odoo_tests` tool inspects an addon's Python models, fields, constraints, business actions, and security access rules to automatically generate comprehensive Odoo `TransactionCase` automated test suites (`tests/test_*.py` and `tests/__init__.py`).
+
+Capabilities include:
+- **Model CRUD & Fixture Generation**: Scaffolds `setUpClass` with valid default values for required model fields, along with `test_record_creation`, `test_record_write`, and `test_record_unlink`.
+- **Constraint Validation Tests**: Detects `@api.constrains` decorators and generates `with self.assertRaises(ValidationError)` test methods to verify data integrity guards.
+- **Action & Compute Method Tests**: Discovers public action methods (`action_*`) and computed methods (`_compute_*`), generating verification test cases.
+- **Access Rights Verification**: Parses `security/ir.model.access.csv` and scaffolds security permission tests (`check_access_rights("read")`).
+- **Clean Registration & Overwrite Protection**: Maintains `tests/__init__.py` imports, defaults to `dry_run=True` for safe code previewing, and respects `overwrite=False` to preserve existing custom test code.
+
 ## Requirements
 
 - Python 3.12 or a compatible Python version
@@ -195,7 +206,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 130 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, entry points, and edge cases.
+The current test suite contains 139 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -254,6 +265,7 @@ Once configured, you can prompt your AI assistant with queries like:
 - *"Migrate my Odoo 16 module at `/path/to/my_addon` to Odoo 19: preview the diffs first with dry_run, then scaffold OpenUpgrade database scripts."*
 - *"Inspect my frontend component at `static/src/components/counter.js` and its QWeb XML template for modern OWL 2 compatibility."*
 - *"Generate OpenUpgrade migration scripts for `/path/to/my_addon` to rename column `client_order_ref` to `customer_reference` on `sale_order` and backfill computed field `amount_tax`."*
+- *"Scaffold comprehensive automated unit tests for all models in my addon at `/path/to/my_addon`, including CRUD, constraints, and access rights."*
 
 ## Run with MCP Inspector
 
