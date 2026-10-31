@@ -135,6 +135,18 @@ Capabilities include:
   - Defaults to `dry_run=True`, generating git-compatible unified diffs without modifying files on disk.
   - When `dry_run=False` is specified, creates a timestamped full backup under `_migration_backups/<timestamp>/` before applying any changes to disk.
 
+### 10. Modern OWL & JavaScript Analyzer
+
+The `analyze_odoo_owl_component` tool inspects custom Odoo frontend files (`static/src/**/*.js` and `static/src/**/*.xml`) to ensure compatibility with modern ES modules and Owl 2 (Odoo 16/17/18/19).
+
+Capabilities include:
+- **Legacy Framework Detection**: Flags obsolete Odoo JavaScript patterns including `odoo.define(...)`, `Widget.extend`, `require("web.Widget")`, and `require("web.core")`.
+- **ES Module Headers**: Verifies that modern JavaScript files declare the mandatory `/** @odoo-module **/` header comment for bundling.
+- **OWL 2 Patch Modernization**: Detects obsolete 3-argument `patch(target, "name", {...})` calls and guides migration to modern 2-argument `patch(target, {...})` syntax (Odoo 17+).
+- **Component & Registry Inspection**: Identifies components extending `Component` and tracks registrations into categories (`fields`, `views`, `actions`, `services`).
+- **QWeb Template Validation**: Verifies `<templates>` root structure, unique `t-name` declarations, and flags security-deprecated `t-raw` attributes in favor of `t-out`.
+- **Cross-File Template Resolution**: When inspecting a directory or addon, cross-references component `static template = "..."` declarations against defined `<t t-name="...">` templates to catch missing or mistyped template names before runtime.
+
 ## Requirements
 
 - Python 3.12 or a compatible Python version
@@ -172,7 +184,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 112 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration (XML views, Python AST deprecations, Enterprise edition audit) & OpenUpgrade scaffolding, entry points, and edge cases.
+The current test suite contains 123 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -229,6 +241,7 @@ Once configured, you can prompt your AI assistant with queries like:
 - *"Analyze `models/res_partner.py` for missing inverse fields or incomplete @api decorators."*
 - *"Verify my `security/ir.model.access.csv` permissions file."*
 - *"Migrate my Odoo 16 module at `/path/to/my_addon` to Odoo 19: preview the diffs first with dry_run, then scaffold OpenUpgrade database scripts."*
+- *"Inspect my frontend component at `static/src/components/counter.js` and its QWeb XML template for modern OWL 2 compatibility."*
 
 ## Run with MCP Inspector
 

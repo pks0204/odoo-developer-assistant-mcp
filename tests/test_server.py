@@ -4,6 +4,7 @@ from unittest.mock import patch
 
 from server import (
     analyze_odoo_error,
+    analyze_odoo_owl_component,
     analyze_odoo_python_model,
     analyze_odoo_security,
     analyze_odoo_xml_view,
@@ -2091,3 +2092,257 @@ def test_migrate_addon_handles_python_syntax_error_gracefully(tmp_path: Path):
     assert result["summary"]["python_files_scanned"] == 1
     syntax_issue = next(i for i in result["python_audit"] if i["issue_type"] == "PYTHON_SYNTAX_ERROR")
     assert "Failed to parse Python syntax" in syntax_issue["message"]
+
+
+# --------------------------------------------------
+# Tests for analyze_odoo_owl_component
+# --------------------------------------------------
+
+def test_analyze_owl_invalid_path(tmp_path: Path):
+    # Non-string path
+    res_num = analyze_odoo_owl_component(12345)
+    assert res_num["success"] is False
+    assert "Please provide a file or directory path" in res_num["error"]
+
+    # Nonexistent path
+    res_non = analyze_odoo_owl_component(str(tmp_path / "does_not_exist"))
+    assert res_non["success"] is False
+    assert "Path does not exist" in res_non["error"]
+
+    # Unsupported extension
+    txt_file = tmp_path / "notes.txt"
+    txt_file.write_text("notes", encoding="utf-8")
+    res_ext = analyze_odoo_owl_component(str(txt_file))
+    assert res_ext["success"] is False
+    assert "Unsupported file extension" in res_ext["error"]
+
+    # Out of addon sandbox
+    addon_dir = tmp_path / "addon"
+    addon_dir.mkdir()
+    outside_file = tmp_path / "outside.js"
+    outside_file.write_text("console.log('hi');", encoding="utf-8")
+    res_sandbox = analyze_odoo_owl_component(str(outside_file), addon_path=str(addon_dir))
+    assert res_sandbox["success"] is False
+    assert "is outside the addon directory" in res_sandbox["error"]
+
+
+def test_analyze_owl_component_valid_js(tmp_path: Path):
+    js_file = tmp_path / "custom_widget.js"
+    js_file.write_text(
+        "/** @odoo-module **/\n\n"
+        "import { Component } from '@odoo/owl';\n"
+        "import { registry } from '@web/core/registry';\n\n"
+        "export class CustomWidget extends Component {\n"
+        "    static template = 'my_module.CustomWidget';\n"
+        "}\n\n"
+        "registry.category('fields').add('custom_widget', CustomWidget);\n",
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(js_file))
+    assert res["success"] is True
+    assert res["valid"] is True
+    assert res["summary"]["error_count"] == 0
+    assert res["summary"]["components_found"] == 1
+    assert res["components"][0]["class_name"] == "CustomWidget"
+    assert res["components"][0]["template"] == "my_module.CustomWidget"
+    assert res["summary"]["registries_found"] == 1
+    assert res["registries"][0]["category"] == "fields"
+    assert res["registries"][0]["name"] == "custom_widget"
+
+
+def test_analyze_owl_component_missing_module_header(tmp_path: Path):
+    js_file = tmp_path / "no_header.js"
+    js_file.write_text(
+        "import { Component } from '@odoo/owl';\n\n"
+        "export class NoHeader extends Component {\n"
+        "    static template = 'my_module.NoHeader';\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(js_file))
+    assert res["success"] is True
+    assert any(w["code"] == "MISSING_ODOO_MODULE_HEADER" for w in res["warnings"])
+    assert any("/** @odoo-module **/" in s for s in res["suggestions"])
+
+
+def test_analyze_owl_component_legacy_define_and_widget(tmp_path: Path):
+    js_file = tmp_path / "legacy_widget.js"
+    js_file.write_text(
+        "odoo.define('my_module.LegacyWidget', function (require) {\n"
+        "    'use strict';\n"
+        "    const Widget = require('web.Widget');\n"
+        "    const core = require('web.core');\n\n"
+        "    const MyWidget = Widget.extend({\n"
+        "        init: function () {}\n"
+        "    });\n"
+        "    return MyWidget;\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(js_file))
+    assert res["success"] is True
+    assert res["valid"] is False
+    assert res["summary"]["error_count"] >= 3
+    error_codes = {e["code"] for e in res["errors"]}
+    assert "LEGACY_ODOO_DEFINE" in error_codes
+    assert "LEGACY_WIDGET_EXTEND" in error_codes
+    assert "LEGACY_REQUIRE_MODULE" in error_codes
+
+
+def test_analyze_owl_component_legacy_patch_syntax(tmp_path: Path):
+    js_file = tmp_path / "patch_test.js"
+    js_file.write_text(
+        "/** @odoo-module **/\n"
+        "import { patch } from '@web/core/utils/patch';\n"
+        "import { Orderline } from '@point_of_sale/app/generic_components/orderline/orderline';\n\n"
+        "patch(Orderline.prototype, 'pos_restaurant.Orderline', {\n"
+        "    setup() {\n"
+        "        super.setup();\n"
+        "    }\n"
+        "});\n",
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(js_file))
+    assert res["success"] is True
+    assert any(w["code"] == "LEGACY_PATCH_SYNTAX" for w in res["warnings"])
+    assert any("Update patch() calls" in s for s in res["suggestions"])
+
+
+def test_analyze_owl_component_valid_xml_template(tmp_path: Path):
+    xml_file = tmp_path / "template.xml"
+    xml_file.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<templates xml:space="preserve">\n'
+        '    <t t-name="my_module.CustomWidget">\n'
+        '        <div class="custom-widget">\n'
+        '            <span t-out="props.title"/>\n'
+        '        </div>\n'
+        '    </t>\n'
+        '</templates>\n',
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(xml_file))
+    assert res["success"] is True
+    assert res["valid"] is True
+    assert res["summary"]["templates_found"] == 1
+    assert res["templates"][0]["name"] == "my_module.CustomWidget"
+    assert res["summary"]["error_count"] == 0
+
+
+def test_analyze_owl_component_obsolete_t_raw(tmp_path: Path):
+    xml_file = tmp_path / "bad_template.xml"
+    xml_file.write_text(
+        '<templates xml:space="preserve">\n'
+        '    <t t-name="my_module.BadWidget">\n'
+        '        <div t-raw="props.htmlContent"/>\n'
+        '    </t>\n'
+        '</templates>\n',
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(xml_file))
+    assert res["success"] is True
+    assert res["valid"] is False
+    assert any(e["code"] == "OBSOLETE_T_RAW" for e in res["errors"])
+
+
+def test_analyze_owl_component_duplicate_template_name(tmp_path: Path):
+    xml_file = tmp_path / "dup_templates.xml"
+    xml_file.write_text(
+        '<templates>\n'
+        '    <t t-name="my_module.DupWidget"><div>A</div></t>\n'
+        '    <t t-name="my_module.DupWidget"><div>B</div></t>\n'
+        '</templates>\n',
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(xml_file))
+    assert res["success"] is True
+    assert any(e["code"] == "DUPLICATE_TEMPLATE_NAME" for e in res["errors"])
+
+
+def test_analyze_owl_component_directory_cross_reference(tmp_path: Path):
+    src_dir = tmp_path / "static" / "src"
+    src_dir.mkdir(parents=True)
+
+    js_file = src_dir / "counter.js"
+    js_file.write_text(
+        "/** @odoo-module **/\n"
+        "import { Component } from '@odoo/owl';\n\n"
+        "export class Counter extends Component {\n"
+        "    static template = 'my_module.Counter';\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    xml_file = src_dir / "counter.xml"
+    xml_file.write_text(
+        '<templates xml:space="preserve">\n'
+        '    <t t-name="my_module.Counter">\n'
+        '        <button t-on-click="increment">Click</button>\n'
+        '    </t>\n'
+        '</templates>\n',
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(src_dir))
+    assert res["success"] is True
+    assert res["valid"] is True
+    assert res["summary"]["files_scanned"] == 2
+    assert res["summary"]["components_found"] == 1
+    assert res["summary"]["templates_found"] == 1
+    # Should have no UNRESOLVED_OWL_TEMPLATE warning because counter matches counter.xml
+    assert not any(w["code"] == "UNRESOLVED_OWL_TEMPLATE" for w in res["warnings"])
+
+
+def test_analyze_owl_component_unresolved_template(tmp_path: Path):
+    src_dir = tmp_path / "static" / "src"
+    src_dir.mkdir(parents=True)
+
+    js_file = src_dir / "unresolved.js"
+    js_file.write_text(
+        "/** @odoo-module **/\n"
+        "import { Component } from '@odoo/owl';\n\n"
+        "export class UnresolvedComponent extends Component {\n"
+        "    static template = 'my_module.MissingTemplate';\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    xml_file = src_dir / "other.xml"
+    xml_file.write_text(
+        '<templates>\n'
+        '    <t t-name="my_module.OtherTemplate"><span/></t>\n'
+        '</templates>\n',
+        encoding="utf-8",
+    )
+
+    res = analyze_odoo_owl_component(str(src_dir))
+    assert res["success"] is True
+    assert any(w["code"] == "UNRESOLVED_OWL_TEMPLATE" for w in res["warnings"])
+    assert any("my_module.MissingTemplate" in w["message"] for w in res["warnings"])
+
+
+def test_analyze_owl_component_file_size_and_empty(tmp_path: Path):
+    empty_js = tmp_path / "empty.js"
+    empty_js.write_text("   \n", encoding="utf-8")
+    res_empty_js = analyze_odoo_owl_component(str(empty_js))
+    assert res_empty_js["success"] is True
+    assert any(e["code"] == "EMPTY_JS_FILE" for e in res_empty_js["errors"])
+
+    empty_xml = tmp_path / "empty.xml"
+    empty_xml.write_text("   \n", encoding="utf-8")
+    res_empty_xml = analyze_odoo_owl_component(str(empty_xml))
+    assert res_empty_xml["success"] is True
+    assert any(e["code"] == "EMPTY_TEMPLATE_FILE" for e in res_empty_xml["errors"])
+
+    large_js = tmp_path / "large.js"
+    large_js.write_text("a" * 500_001, encoding="utf-8")
+    res_large = analyze_odoo_owl_component(str(large_js))
+    assert res_large["success"] is False
+    assert "File is too large to inspect" in res_large["error"]

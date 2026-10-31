@@ -8,6 +8,7 @@ import re
 import shutil
 import socket
 import urllib.parse
+import xml.etree.ElementTree as ET
 import xml.sax
 import xmlrpc.client
 
@@ -3181,6 +3182,419 @@ def migrate_odoo_addon(
             "notes": enterprise_notes,
         },
         "python_audit": python_issues,
+        "suggestions": suggestions,
+    }
+
+
+MAX_OWL_FILE_SIZE = 500_000  # 500 KB
+
+ODOO_MODULE_PATTERN = re.compile(r'/\*\*[\s*]*@odoo-module[\s*]*\*/')
+LEGACY_ODOO_DEFINE_PATTERN = re.compile(r'\bodoo\.define\s*\(\s*([\'"][^\'"]+[\'"])')
+LEGACY_WIDGET_EXTEND_PATTERN = re.compile(r'(\bWidget\.extend\b|\brequire\s*\(\s*[\'"]web\.Widget[\'"]\s*\))')
+LEGACY_REQUIRE_MODULE_PATTERN = re.compile(r'\brequire\s*\(\s*[\'"](web\.[a-zA-Z0-9_]+)[\'"]\s*\)')
+LEGACY_PATCH_PATTERN = re.compile(r'\bpatch\s*\(\s*([a-zA-Z0-9_$.]+)\s*,\s*([\'"][^\'"]+[\'"])\s*,')
+OWL_COMPONENT_CLASS_PATTERN = re.compile(r'\bclass\s+([A-Za-z0-9_$]+)\s+extends\s+Component\b')
+OWL_STATIC_TEMPLATE_PATTERN = re.compile(r'\bstatic\s+template\s*=\s*([\'"][^\'"]+[\'"])')
+REGISTRY_ADD_PATTERN = re.compile(r'registry\s*\.\s*category\s*\(\s*([\'"][^\'"]+[\'"])\s*\)\s*\.\s*add\s*\(\s*([\'"][^\'"]+[\'"])')
+OBSOLETE_T_RAW_PATTERN = re.compile(r'\bt-raw\s*=\s*([\'"][^\'"]+[\'"])')
+T_NAME_PATTERN = re.compile(r'\bt-name\s*=\s*([\'"][^\'"]+[\'"])')
+
+
+@mcp.tool()
+def analyze_odoo_owl_component(
+    path: str,
+    addon_path: str | None = None,
+) -> dict:
+    """Analyze Odoo frontend JavaScript, OWL 2 components, and QWeb XML templates.
+
+    Detects legacy Odoo JavaScript (odoo.define, Widget.extend, require('web.core')),
+    missing '/** @odoo-module **/' headers, obsolete patch() 3-argument syntax,
+    obsolete 't-raw' template attributes, and cross-references component static templates
+    against declared XML <t t-name="..."> templates.
+
+    Args:
+        path: Path to a single .js file, .xml template file, or directory (e.g., static/src/).
+        addon_path: Optional path to containing addon directory to enforce sandboxed access.
+    """
+    if not isinstance(path, str) or not path.strip():
+        return {
+            "success": False,
+            "error": "Please provide a file or directory path as text.",
+        }
+
+    try:
+        resolved_path = Path(path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "success": False,
+            "error": f"Invalid path: {exc}",
+        }
+
+    if not resolved_path.exists():
+        return {
+            "success": False,
+            "error": f"Path does not exist: {resolved_path}",
+        }
+
+    if addon_path is not None:
+        if not isinstance(addon_path, str) or not addon_path.strip():
+            return {
+                "success": False,
+                "error": "addon_path must be a non-empty string when provided.",
+            }
+        try:
+            resolved_addon = Path(addon_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {
+                "success": False,
+                "error": f"Invalid addon path: {exc}",
+            }
+
+        if not resolved_addon.is_dir():
+            return {
+                "success": False,
+                "error": f"Addon directory does not exist: {resolved_addon}",
+            }
+
+        try:
+            resolved_path.relative_to(resolved_addon)
+        except ValueError:
+            return {
+                "success": False,
+                "error": (
+                    f"Path '{resolved_path}' is outside the addon directory '{resolved_addon}'."
+                ),
+            }
+    else:
+        resolved_addon = None
+
+    files_to_scan = []
+    if resolved_path.is_file():
+        if resolved_path.suffix.lower() not in (".js", ".xml"):
+            return {
+                "success": False,
+                "error": "Unsupported file extension. Please provide a .js or .xml file or a directory.",
+            }
+        try:
+            file_size = resolved_path.stat().st_size
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": f"Unable to access file: {exc}",
+            }
+        if file_size > MAX_OWL_FILE_SIZE:
+            return {
+                "success": False,
+                "error": (
+                    f"File is too large to inspect ({file_size} bytes). "
+                    f"Maximum allowed size is {MAX_OWL_FILE_SIZE} bytes."
+                ),
+            }
+        files_to_scan.append(resolved_path)
+    else:
+        for f in sorted(resolved_path.glob("**/*")):
+            if f.is_file() and f.suffix.lower() in (".js", ".xml"):
+                if not any(part.startswith(".") for part in f.parts) and "_migration_backups" not in f.parts:
+                    files_to_scan.append(f)
+
+    if not files_to_scan and resolved_path.is_dir():
+        return {
+            "success": True,
+            "valid": True,
+            "path": str(resolved_path),
+            "summary": {
+                "files_scanned": 0,
+                "js_files_count": 0,
+                "xml_files_count": 0,
+                "components_found": 0,
+                "templates_found": 0,
+                "registries_found": 0,
+                "error_count": 0,
+                "warning_count": 0,
+                "info_count": 0,
+            },
+            "components": [],
+            "templates": [],
+            "registries": [],
+            "errors": [],
+            "warnings": [],
+            "info": [],
+            "suggestions": ["No .js or .xml files found in directory."],
+        }
+
+    errors = []
+    warnings = []
+    info = []
+    suggestions = []
+    components = []
+    templates = []
+    registries = []
+    js_files_count = 0
+    xml_files_count = 0
+
+    base_dir = resolved_addon if resolved_addon else (resolved_path if resolved_path.is_dir() else resolved_path.parent)
+
+    for file_path in files_to_scan:
+        rel_path = str(file_path.relative_to(base_dir)) if file_path.is_relative_to(base_dir) else str(file_path)
+        try:
+            file_size = file_path.stat().st_size
+        except OSError as exc:
+            errors.append({
+                "code": "FILE_ACCESS_ERROR",
+                "message": f"Unable to access file: {exc}",
+                "file": rel_path,
+                "line": 1,
+                "element": None,
+            })
+            continue
+
+        if file_size > MAX_OWL_FILE_SIZE:
+            errors.append({
+                "code": "FILE_EXCEEDS_SIZE",
+                "message": f"File is too large ({file_size} bytes). Maximum allowed size is {MAX_OWL_FILE_SIZE} bytes.",
+                "file": rel_path,
+                "line": 1,
+                "element": None,
+            })
+            continue
+
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            errors.append({
+                "code": "UNICODE_DECODE_ERROR",
+                "message": f"Unable to decode file as UTF-8: {exc}",
+                "file": rel_path,
+                "line": 1,
+                "element": None,
+            })
+            continue
+
+        if file_path.suffix.lower() == ".js":
+            js_files_count += 1
+            if not content.strip():
+                errors.append({
+                    "code": "EMPTY_JS_FILE",
+                    "message": "JavaScript file is empty.",
+                    "file": rel_path,
+                    "line": 1,
+                    "element": None,
+                })
+                continue
+
+            has_odoo_module = bool(ODOO_MODULE_PATTERN.search(content))
+            has_es_imports = bool(re.search(r'\bimport\s+.*\s+from\s+[\'"][^\'"]+[\'"]', content))
+            has_components = bool(OWL_COMPONENT_CLASS_PATTERN.search(content))
+
+            if (has_es_imports or has_components) and not has_odoo_module:
+                warnings.append({
+                    "code": "MISSING_ODOO_MODULE_HEADER",
+                    "message": "Missing '/** @odoo-module **/' header. Modern Odoo 16/17/18/19 ES modules require this header at the beginning of the file.",
+                    "file": rel_path,
+                    "line": 1,
+                    "element": None,
+                })
+
+            for m in LEGACY_ODOO_DEFINE_PATTERN.finditer(content):
+                line = content[:m.start()].count('\n') + 1
+                errors.append({
+                    "code": "LEGACY_ODOO_DEFINE",
+                    "message": f"Legacy 'odoo.define({m.group(1)}, ...)' detected. Modern Odoo uses standard ES modules with '/** @odoo-module **/'.",
+                    "file": rel_path,
+                    "line": line,
+                    "element": m.group(0),
+                })
+
+            for m in LEGACY_WIDGET_EXTEND_PATTERN.finditer(content):
+                line = content[:m.start()].count('\n') + 1
+                errors.append({
+                    "code": "LEGACY_WIDGET_EXTEND",
+                    "message": f"Legacy widget syntax '{m.group(1)}' detected. The old Widget class was completely removed in modern Odoo (use Owl Component).",
+                    "file": rel_path,
+                    "line": line,
+                    "element": m.group(1),
+                })
+
+            for m in LEGACY_REQUIRE_MODULE_PATTERN.finditer(content):
+                line = content[:m.start()].count('\n') + 1
+                errors.append({
+                    "code": "LEGACY_REQUIRE_MODULE",
+                    "message": f"Legacy require('{m.group(1)}') detected. In modern Odoo, import ES modules directly (e.g. from '@web/core/...').",
+                    "file": rel_path,
+                    "line": line,
+                    "element": m.group(0),
+                })
+
+            for m in LEGACY_PATCH_PATTERN.finditer(content):
+                line = content[:m.start()].count('\n') + 1
+                target = m.group(1)
+                patch_name = m.group(2)
+                warnings.append({
+                    "code": "LEGACY_PATCH_SYNTAX",
+                    "message": f"Legacy 3-argument patch syntax detected on '{target}' with name {patch_name}. In Odoo 17/18/19, patch() takes 2 arguments: patch(target, patchDef).",
+                    "file": rel_path,
+                    "line": line,
+                    "element": m.group(0),
+                })
+
+            for m in OWL_COMPONENT_CLASS_PATTERN.finditer(content):
+                comp_name = m.group(1)
+                line = content[:m.start()].count('\n') + 1
+                class_chunk = content[m.start():]
+                tmpl_match = OWL_STATIC_TEMPLATE_PATTERN.search(class_chunk)
+                template_name = tmpl_match.group(1).strip("'\"") if tmpl_match else None
+
+                components.append({
+                    "class_name": comp_name,
+                    "template": template_name,
+                    "file": rel_path,
+                    "line": line,
+                })
+
+                if not template_name:
+                    info.append({
+                        "code": "NO_STATIC_TEMPLATE",
+                        "message": f"Component '{comp_name}' does not declare a 'static template'. Ensure it renders dynamically or inherits a template.",
+                        "file": rel_path,
+                        "line": line,
+                        "element": comp_name,
+                    })
+
+            for m in REGISTRY_ADD_PATTERN.finditer(content):
+                category = m.group(1).strip("'\"")
+                reg_name = m.group(2).strip("'\"")
+                line = content[:m.start()].count('\n') + 1
+                registries.append({
+                    "category": category,
+                    "name": reg_name,
+                    "file": rel_path,
+                    "line": line,
+                })
+
+        elif file_path.suffix.lower() == ".xml":
+            xml_files_count += 1
+            if not content.strip():
+                errors.append({
+                    "code": "EMPTY_TEMPLATE_FILE",
+                    "message": "OWL template file is empty.",
+                    "file": rel_path,
+                    "line": 1,
+                    "element": None,
+                })
+                continue
+
+            try:
+                root = ET.fromstring(content)
+                if root.tag != "templates" and not root.findall(".//templates"):
+                    warnings.append({
+                        "code": "UNEXPECTED_TEMPLATE_ROOT",
+                        "message": f"Expected <templates> root element in OWL template file, found <{root.tag}>.",
+                        "file": rel_path,
+                        "line": 1,
+                        "element": root.tag,
+                    })
+            except ET.ParseError as exc:
+                line = exc.position[0] if hasattr(exc, "position") and exc.position else 1
+                errors.append({
+                    "code": "XML_SYNTAX_ERROR",
+                    "message": f"XML parse error in template: {exc}",
+                    "file": rel_path,
+                    "line": line,
+                    "element": None,
+                })
+
+            for m in T_NAME_PATTERN.finditer(content):
+                t_name = m.group(1).strip("'\"")
+                line = content[:m.start()].count('\n') + 1
+                templates.append({
+                    "name": t_name,
+                    "file": rel_path,
+                    "line": line,
+                })
+
+            for m in OBSOLETE_T_RAW_PATTERN.finditer(content):
+                line = content[:m.start()].count('\n') + 1
+                raw_expr = m.group(1).strip("'\"")
+                errors.append({
+                    "code": "OBSOLETE_T_RAW",
+                    "message": f"Obsolescent 't-raw=\"{raw_expr}\"' detected. Modern Owl and QWeb security removed t-raw in favor of 't-out'.",
+                    "file": rel_path,
+                    "line": line,
+                    "element": m.group(0),
+                })
+
+    # Cross-referencing: Check unresolved templates if templates were found or XML files scanned
+    if xml_files_count > 0:
+        template_names_set = {t["name"] for t in templates}
+        for comp in components:
+            tmpl = comp.get("template")
+            if tmpl and tmpl not in template_names_set:
+                warnings.append({
+                    "code": "UNRESOLVED_OWL_TEMPLATE",
+                    "message": f"Component '{comp['class_name']}' in {comp['file']} references template '{tmpl}', but no matching <t t-name=\"{tmpl}\"> was found in scanned XML templates.",
+                    "file": comp["file"],
+                    "line": comp["line"],
+                    "element": tmpl,
+                })
+
+    # Check duplicate templates
+    seen_templates = set()
+    for t in templates:
+        t_name = t["name"]
+        if t_name in seen_templates:
+            errors.append({
+                "code": "DUPLICATE_TEMPLATE_NAME",
+                "message": f"Duplicate template name '{t_name}' found in {t['file']} (line {t['line']}).",
+                "file": t["file"],
+                "line": t["line"],
+                "element": t_name,
+            })
+        seen_templates.add(t_name)
+
+    valid = len(errors) == 0
+
+    if errors:
+        suggestions.append(
+            "Resolve errors to ensure compatibility with modern Odoo ES modules and Owl 2."
+        )
+    if any(w["code"] == "LEGACY_PATCH_SYNTAX" for w in warnings):
+        suggestions.append(
+            "Update patch() calls from patch(target, 'name', {...}) to patch(target, {...}) for Odoo 17/18/19 compatibility."
+        )
+    if any(w["code"] == "MISSING_ODOO_MODULE_HEADER" for w in warnings):
+        suggestions.append(
+            "Add '/** @odoo-module **/' at the top of JavaScript files so Odoo bundles them as ES modules."
+        )
+    if any(w["code"] == "UNRESOLVED_OWL_TEMPLATE" for w in warnings):
+        suggestions.append(
+            "Ensure component static template names match defined <t t-name=\"...\"> attributes in static/src/**/*.xml."
+        )
+    if valid and not warnings:
+        suggestions.append(
+            "Frontend files passed static OWL and ES module checks."
+        )
+
+    return {
+        "success": True,
+        "valid": valid,
+        "path": str(resolved_path),
+        "summary": {
+            "files_scanned": len(files_to_scan),
+            "js_files_count": js_files_count,
+            "xml_files_count": xml_files_count,
+            "components_found": len(components),
+            "templates_found": len(templates),
+            "registries_found": len(registries),
+            "error_count": len(errors),
+            "warning_count": len(warnings),
+            "info_count": len(info),
+        },
+        "components": components,
+        "templates": templates,
+        "registries": registries,
+        "errors": errors,
+        "warnings": warnings,
+        "info": info,
         "suggestions": suggestions,
     }
 
