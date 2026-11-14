@@ -31,18 +31,16 @@ The `inspect_odoo_module` tool reads an addon's `__manifest__.py` file and repor
 
 Dependency checks cover only the directories supplied to the tool. A dependency reported as missing may still exist elsewhere in an Odoo installation.
 
-### 3. Odoo Manifest Validator
+### 3. Odoo Manifest & Pre-Flight Installation Validator
 
-The `validate_odoo_manifest` tool checks:
+The `validate_odoo_manifest` tool performs deep static validation and installation pre-flight checks:
 
-- Required manifest fields
-- Field types
-- Referenced data files
-- Missing files
-- Unsafe file paths
-- Manifest syntax
-
-The manifest is parsed without executing its Python code.
+- **Required Fields & Types**: Validates required metadata fields (`name`, `version`, `depends`) and field types.
+- **Referenced File Integrity**: Verifies that all files declared in `data` and `demo` exist on disk, with confinement checks against path traversal or symlink escapes.
+- **External Dependencies Verification**: Inspects `external_dependencies` to verify that declared Python packages (`external_dependencies['python']`) are importable (with automatic distribution-to-module mapping) and required system executables (`external_dependencies['bin']`) exist on PATH, generating exact `pip install <pkg>` recommendations.
+- **Sequential Data Load Order**: Detects unsafe load ordering in `'data'` (e.g., view files declared before `security/ir.model.access.csv` or sequence files) to prevent install-time `ParseError: External ID not found` crashes.
+- **Dependency Guard**: Flags self-dependencies (`addon` depending on itself) and circular dependency chains across local addon directories.
+- **Syntax Safety**: Parses the manifest AST safely without executing arbitrary Python code.
 
 ### 4. Odoo XML View Analyzer
 
@@ -299,7 +297,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 166 tests covering error classification, traceback stack parsing, PostgreSQL constraint diagnostics, Owl 2 crash analysis, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
+The current test suite contains 172 tests covering error classification, traceback stack parsing, PostgreSQL constraint diagnostics, Owl 2 crash analysis, addon inspection, manifest pre-flight installation checks, external dependencies verification, sequential data load ordering diagnostics, circular module dependency detection, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -413,7 +411,6 @@ odoo-developer-assistant/
 
 ## Limitations
 
-- Manifest validation does not guarantee that an addon will install successfully in Odoo.
 - XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
 - Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
 - The unified addon health check performs static analysis across files; complete behavioral verification requires testing the addon inside an active Odoo runtime environment.

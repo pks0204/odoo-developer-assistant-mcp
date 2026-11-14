@@ -3,6 +3,7 @@ import ast
 import csv
 import datetime
 import difflib
+import importlib.util
 import io
 from pathlib import Path
 import re
@@ -550,12 +551,199 @@ def inspect_odoo_module(
         "application": manifest.get("application", False),
         "checked_addons_directories": [str(root) for root in roots],
         "dependency_status": dependency_status,
+        "external_dependencies": manifest.get("external_dependencies", {}),
         "note": (
             "Dependencies are checked across the supplied addons "
             "directories only. A missing dependency does not prove "
             "it is unavailable elsewhere in the Odoo installation."
         ),
     }
+
+
+PYTHON_PKG_IMPORT_MAP = {
+    "beautifulsoup4": "bs4",
+    "pillow": "PIL",
+    "pyyaml": "yaml",
+    "pyjwt": "jwt",
+    "psycopg2-binary": "psycopg2",
+    "python-dateutil": "dateutil",
+    "python-magic": "magic",
+    "python-barcode": "barcode",
+    "pycryptodome": "Crypto",
+    "paho-mqtt": "paho",
+    "suds-jurko": "suds",
+    "google-auth": "google.auth",
+    "google-api-python-client": "googleapiclient",
+    "azure-storage-blob": "azure.storage.blob",
+    "cryptography": "cryptography",
+    "openpyxl": "openpyxl",
+    "xlrd": "xlrd",
+    "xlsxwriter": "xlsxwriter",
+    "pandas": "pandas",
+    "numpy": "numpy",
+    "requests": "requests",
+    "zeep": "zeep",
+    "qrcode": "qrcode",
+    "reportlab": "reportlab",
+    "phonenumbers": "phonenumbers",
+    "pdfminer.six": "pdfminer",
+    "pdfminer": "pdfminer",
+    "stripe": "stripe",
+    "twilio": "twilio",
+    "paramiko": "paramiko",
+    "boto3": "boto3",
+}
+
+
+def _check_external_dependencies(external_deps: dict) -> tuple[dict, list[dict]]:
+    """Verify python packages and binary dependencies declared in manifest."""
+    checked = {"python": [], "bin": []}
+    missing = []
+
+    if not isinstance(external_deps, dict):
+        return checked, missing
+
+    py_deps = external_deps.get("python", [])
+    if isinstance(py_deps, list):
+        for pkg in py_deps:
+            if not isinstance(pkg, str) or not pkg.strip():
+                continue
+            pkg_clean = pkg.strip()
+            lookup = pkg_clean.lower()
+            mod_name = PYTHON_PKG_IMPORT_MAP.get(lookup, pkg_clean.replace("-", "_"))
+
+            spec = None
+            try:
+                spec = importlib.util.find_spec(mod_name)
+            except (ModuleNotFoundError, ValueError, AttributeError):
+                spec = None
+
+            if spec is not None:
+                checked["python"].append({
+                    "package": pkg_clean,
+                    "module": mod_name,
+                    "status": "installed",
+                })
+            else:
+                item = {
+                    "type": "python",
+                    "package": pkg_clean,
+                    "module": mod_name,
+                    "status": "missing",
+                    "suggestion": f"Install required Python package: pip install {pkg_clean}",
+                }
+                checked["python"].append(item)
+                missing.append(item)
+
+    bin_deps = external_deps.get("bin", [])
+    if isinstance(bin_deps, list):
+        for b in bin_deps:
+            if not isinstance(b, str) or not b.strip():
+                continue
+            b_clean = b.strip()
+            found_path = shutil.which(b_clean)
+            if found_path:
+                checked["bin"].append({
+                    "binary": b_clean,
+                    "path": found_path,
+                    "status": "installed",
+                })
+            else:
+                item = {
+                    "type": "bin",
+                    "binary": b_clean,
+                    "status": "missing",
+                    "suggestion": f"Install required system executable '{b_clean}' on host PATH.",
+                }
+                checked["bin"].append(item)
+                missing.append(item)
+
+    return checked, missing
+
+
+def _check_data_file_load_order(data_files: list[str]) -> list[dict]:
+    """Inspect sequential load order of manifest 'data' files.
+
+    Flags unsafe orders where view files precede security access controls or master data.
+    """
+    if not isinstance(data_files, list):
+        return []
+
+    issues = []
+    seen_views = []
+
+    for idx, f in enumerate(data_files):
+        if not isinstance(f, str):
+            continue
+        f_norm = f.replace("\\", "/").lower()
+
+        is_view = f_norm.startswith("views/") or "_views.xml" in f_norm or "_view.xml" in f_norm
+        is_security = f_norm.startswith("security/") or "ir.model.access.csv" in f_norm or "security.xml" in f_norm
+
+        if is_view:
+            seen_views.append((idx, f))
+        elif is_security and seen_views:
+            first_view_idx, first_view = seen_views[0]
+            issues.append({
+                "code": "UNSAFE_DATA_LOAD_ORDER",
+                "severity": "warning",
+                "message": (
+                    f"Security file '{f}' is declared at position {idx + 1} after view file '{first_view}' (position {first_view_idx + 1}). "
+                    "In Odoo, security groups and access rights should be declared before view definitions to prevent install-time ParseError / access errors."
+                ),
+                "security_file": f,
+                "preceding_view": first_view,
+            })
+
+    return issues
+
+
+def _check_circular_dependencies(addon_name: str, depends: list[str], roots: list[Path]) -> list[list[str]]:
+    """Detect circular dependency chains among locally available addons."""
+    if not addon_name or not depends or not roots:
+        return []
+
+    manifest_cache = {addon_name: [d for d in depends if isinstance(d, str)]}
+
+    def get_module_deps(mod: str) -> list[str]:
+        if mod in manifest_cache:
+            return manifest_cache[mod]
+        for r in roots:
+            m_path = r / mod / "__manifest__.py"
+            if m_path.is_file():
+                try:
+                    tree = ast.parse(m_path.read_text(encoding="utf-8"))
+                    m_dict = ast.literal_eval(tree.body[0].value)
+                    d = m_dict.get("depends", [])
+                    if isinstance(d, list):
+                        manifest_cache[mod] = [dep for dep in d if isinstance(dep, str)]
+                        return manifest_cache[mod]
+                except Exception:
+                    pass
+        manifest_cache[mod] = []
+        return []
+
+    cycles = []
+    visited = set()
+    rec_stack = []
+
+    def dfs(node: str):
+        visited.add(node)
+        rec_stack.append(node)
+
+        for neighbor in get_module_deps(node):
+            if neighbor in rec_stack:
+                cycle_start_idx = rec_stack.index(neighbor)
+                cycle = rec_stack[cycle_start_idx:] + [neighbor]
+                cycles.append(cycle)
+            elif neighbor not in visited:
+                dfs(neighbor)
+
+        rec_stack.pop()
+
+    dfs(addon_name)
+    return cycles
+
 
 @mcp.tool()
 def validate_odoo_manifest(addon_path: str) -> dict:
@@ -654,6 +842,28 @@ def validate_odoo_manifest(addon_path: str) -> dict:
             "'depends' must be a list of non-empty strings."
         )
 
+    # Check self-dependency
+    self_dependency = False
+    raw_depends = manifest.get("depends")
+    if isinstance(raw_depends, list) and addon.name in raw_depends:
+        self_dependency = True
+        field_issues.append(
+            f"Module '{addon.name}' cannot depend on itself in 'depends'."
+        )
+
+    # Check external dependencies (python packages and system binaries)
+    external_deps = manifest.get("external_dependencies", {})
+    if external_deps and not isinstance(external_deps, dict):
+        field_issues.append(
+            "'external_dependencies' must be a dictionary with 'python' and/or 'bin' keys."
+        )
+    checked_external, missing_external = _check_external_dependencies(
+        external_deps if isinstance(external_deps, dict) else {}
+    )
+
+    # Check data files sequential load order
+    load_order_issues = _check_data_file_load_order(manifest.get("data", []))
+
     missing_files = []
     unsafe_paths = []
     checked_files = []
@@ -707,6 +917,8 @@ def validate_odoo_manifest(addon_path: str) -> dict:
         or field_issues
         or missing_files
         or unsafe_paths
+        or missing_external
+        or self_dependency
     )
 
     suggestions = []
@@ -722,6 +934,11 @@ def validate_odoo_manifest(addon_path: str) -> dict:
             "Correct the manifest field types and values."
         )
 
+    if self_dependency:
+        suggestions.append(
+            f"Remove self-dependency '{addon.name}' from 'depends'."
+        )
+
     if missing_files:
         suggestions.append(
             "Create the missing files or correct their paths "
@@ -732,6 +949,14 @@ def validate_odoo_manifest(addon_path: str) -> dict:
         suggestions.append(
             "Use safe paths relative to the addon directory. "
             "Absolute paths and paths escaping the addon are not allowed."
+        )
+
+    for item in missing_external:
+        suggestions.append(item["suggestion"])
+
+    if load_order_issues:
+        suggestions.append(
+            "Move security files (e.g. security/ir.model.access.csv) before view files in manifest 'data' list."
         )
 
     if valid:
@@ -750,6 +975,10 @@ def validate_odoo_manifest(addon_path: str) -> dict:
         "checked_files": checked_files,
         "missing_files": missing_files,
         "unsafe_paths": unsafe_paths,
+        "external_dependencies": checked_external,
+        "missing_external_dependencies": missing_external,
+        "load_order_issues": load_order_issues,
+        "self_dependency": self_dependency,
         "suggestions": suggestions,
     }
 
@@ -2139,9 +2368,11 @@ def check_odoo_addon_health(
                         "found_in": [],
                         "is_standard": False,
                     }
+            cycles = _check_circular_dependencies(resolved_addon.name, deps, roots)
             dep_info = {
                 "checked": True,
                 "dependency_status": dep_status,
+                "circular_dependencies": cycles,
             }
         except Exception as exc:
             dep_info = {"checked": False, "error": str(exc)}
@@ -2314,8 +2545,16 @@ def check_odoo_addon_health(
 
     # Aggregates
     manifest_valid = manifest_res.get("valid", True)
-    manifest_errors_count = len(manifest_res.get("missing_fields", [])) + len(
-        manifest_res.get("missing_files", [])
+    missing_ext_count = len(manifest_res.get("missing_external_dependencies", []))
+    self_dep_count = 1 if manifest_res.get("self_dependency") else 0
+    circular_errors_count = len(dep_info.get("circular_dependencies", []))
+    load_order_warnings_count = len(manifest_res.get("load_order_issues", []))
+
+    manifest_errors_count = (
+        len(manifest_res.get("missing_fields", []))
+        + len(manifest_res.get("missing_files", []))
+        + missing_ext_count
+        + self_dep_count
     )
 
     views_errors_count = sum(len(v["errors"]) for v in views_audit)
@@ -2329,13 +2568,15 @@ def check_odoo_addon_health(
 
     total_errors = (
         manifest_errors_count
+        + circular_errors_count
         + views_errors_count
         + models_errors_count
         + sec_errors_count
         + len(cross_file_errors)
     )
     total_warnings = (
-        views_warnings_count
+        load_order_warnings_count
+        + views_warnings_count
         + models_warnings_count
         + sec_warnings_count
         + len(cross_file_warnings)
@@ -2355,6 +2596,12 @@ def check_odoo_addon_health(
     suggestions = []
     if not manifest_valid:
         suggestions.extend(manifest_res.get("suggestions", []))
+    if missing_ext_count > 0:
+        suggestions.append(f"Install {missing_ext_count} missing external package(s)/binary dependency.")
+    if load_order_warnings_count > 0:
+        suggestions.append("Reorder manifest 'data' entries so security access controls are declared before view files.")
+    if circular_errors_count > 0:
+        suggestions.append("Resolve circular module dependencies detected in 'depends'.")
     if views_errors_count > 0:
         suggestions.append(f"Fix {views_errors_count} error(s) in view XML files.")
     if models_errors_count > 0:
@@ -2384,8 +2631,17 @@ def check_odoo_addon_health(
         all_errors.append({"file": "__manifest__.py", "code": "MISSING_REQUIRED_FIELD", "message": f"Missing required manifest field: {mf}"})
     for mf in manifest_res.get("missing_files", []):
         all_errors.append({"file": "__manifest__.py", "code": "MISSING_DECLARED_FILE", "message": f"Referenced file not found on disk: {mf}"})
+    for ext_err in manifest_res.get("missing_external_dependencies", []):
+        all_errors.append({"file": "__manifest__.py", "code": "MISSING_EXTERNAL_DEPENDENCY", "message": ext_err.get("suggestion", f"Missing external dependency: {ext_err}")})
+    if manifest_res.get("self_dependency"):
+        all_errors.append({"file": "__manifest__.py", "code": "SELF_DEPENDENCY", "message": f"Module '{resolved_addon.name}' cannot depend on itself in 'depends'."})
+    for cycle in dep_info.get("circular_dependencies", []):
+        all_errors.append({"file": "__manifest__.py", "code": "CIRCULAR_DEPENDENCY", "message": f"Circular module dependency detected: {' -> '.join(cycle)}"})
     if manifest_res.get("syntax_error"):
         all_errors.append({"file": "__manifest__.py", "code": "MANIFEST_SYNTAX_ERROR", "message": manifest_res["syntax_error"]})
+
+    for lo_issue in manifest_res.get("load_order_issues", []):
+        all_warnings.append({"file": "__manifest__.py", "code": "UNSAFE_DATA_LOAD_ORDER", "message": lo_issue.get("message")})
 
     for v in views_audit:
         for err in v.get("errors", []):
@@ -2431,6 +2687,10 @@ def check_odoo_addon_health(
                 "missing_files": manifest_res.get("missing_files", []),
                 "missing_fields": manifest_res.get("missing_fields", []),
                 "field_issues": manifest_res.get("field_issues", []),
+                "external_dependencies": manifest_res.get("external_dependencies", {}),
+                "missing_external_dependencies": manifest_res.get("missing_external_dependencies", []),
+                "load_order_issues": manifest_res.get("load_order_issues", []),
+                "self_dependency": manifest_res.get("self_dependency", False),
             },
             "dependencies": dep_info,
             "views": views_audit,

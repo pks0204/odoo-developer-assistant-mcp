@@ -3303,3 +3303,150 @@ def test_analyze_error_python_traceback_extraction():
     assert tb_summary["originating_frame"]["function"] == "action_confirm"
     assert tb_summary["originating_frame"]["is_custom_code"] is True
     assert tb_summary["exception_type"] == "AttributeError"
+
+
+# --------------------------------------------------
+# Phase 3 Tests: Manifest Pre-Flight & Installation Validation
+# --------------------------------------------------
+
+def test_validate_manifest_detects_missing_python_external_dependency(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "My External Dep Module",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "external_dependencies": {
+                "python": ["non_existent_odoo_pkg_xyz_999"],
+            },
+        },
+    )
+    result = validate_odoo_manifest(str(addon))
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert len(result["missing_external_dependencies"]) == 1
+    dep = result["missing_external_dependencies"][0]
+    assert dep["package"] == "non_existent_odoo_pkg_xyz_999"
+    assert "pip install non_existent_odoo_pkg_xyz_999" in dep["suggestion"]
+
+
+def test_validate_manifest_detects_installed_python_external_dependency(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "My Valid Dep Module",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "external_dependencies": {
+                "python": ["mcp"],
+            },
+        },
+    )
+    result = validate_odoo_manifest(str(addon))
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert len(result["missing_external_dependencies"]) == 0
+    checked = result["external_dependencies"]["python"]
+    assert len(checked) == 1
+    assert checked[0]["package"] == "mcp"
+    assert checked[0]["status"] == "installed"
+
+
+def test_validate_manifest_detects_missing_bin_external_dependency(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "My Binary Dep Module",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "external_dependencies": {
+                "bin": ["non_existent_cli_bin_xyz_999"],
+            },
+        },
+    )
+    result = validate_odoo_manifest(str(addon))
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert len(result["missing_external_dependencies"]) == 1
+    dep = result["missing_external_dependencies"][0]
+    assert dep["type"] == "bin"
+    assert dep["binary"] == "non_existent_cli_bin_xyz_999"
+
+
+def test_validate_manifest_detects_unsafe_data_load_order(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "My Unsafe Load Order Module",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "data": [
+                "views/my_view.xml",
+                "security/ir.model.access.csv",
+            ],
+        },
+    )
+    views_dir = addon / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    (views_dir / "my_view.xml").write_text("<odoo/>", encoding="utf-8")
+    sec_dir = addon / "security"
+    sec_dir.mkdir(parents=True, exist_ok=True)
+    (sec_dir / "ir.model.access.csv").write_text("id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n", encoding="utf-8")
+
+    result = validate_odoo_manifest(str(addon))
+    assert result["success"] is True
+    assert len(result["load_order_issues"]) == 1
+    issue = result["load_order_issues"][0]
+    assert issue["code"] == "UNSAFE_DATA_LOAD_ORDER"
+    assert "security/ir.model.access.csv" in issue["security_file"]
+    assert any("Move security files" in s for s in result["suggestions"])
+
+
+def test_validate_manifest_detects_self_dependency(tmp_path):
+    addon_dir = tmp_path / "self_dep_module"
+    addon_dir.mkdir()
+    manifest_path = addon_dir / "__manifest__.py"
+    manifest_path.write_text(
+        repr({
+            "name": "Self Dep Module",
+            "version": "18.0.1.0.0",
+            "depends": ["base", "self_dep_module"],
+        }),
+        encoding="utf-8",
+    )
+    result = validate_odoo_manifest(str(addon_dir))
+    assert result["success"] is True
+    assert result["valid"] is False
+    assert result["self_dependency"] is True
+    assert any("cannot depend on itself" in issue for issue in result["field_issues"])
+
+
+def test_addon_health_detects_circular_dependencies(tmp_path):
+    mod_a_dir = tmp_path / "mod_a"
+    mod_a_dir.mkdir()
+    (mod_a_dir / "__manifest__.py").write_text(
+        repr({
+            "name": "Module A",
+            "version": "18.0.1.0.0",
+            "depends": ["base", "mod_b"],
+        }),
+        encoding="utf-8",
+    )
+
+    mod_b_dir = tmp_path / "mod_b"
+    mod_b_dir.mkdir()
+    (mod_b_dir / "__manifest__.py").write_text(
+        repr({
+            "name": "Module B",
+            "version": "18.0.1.0.0",
+            "depends": ["base", "mod_a"],
+        }),
+        encoding="utf-8",
+    )
+
+    result = check_odoo_addon_health(str(mod_a_dir), addons_directories=[str(tmp_path)])
+    assert result["success"] is True
+    assert result["health_status"] == "CRITICAL_ISSUES"
+    circ_errors = [e for e in result["errors"] if e.get("code") == "CIRCULAR_DEPENDENCY"]
+    assert len(circ_errors) > 0
+    assert "mod_a -> mod_b -> mod_a" in circ_errors[0]["message"]
