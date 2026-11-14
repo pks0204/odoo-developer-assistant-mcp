@@ -304,7 +304,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 158 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
+The current test suite contains 161 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -419,11 +419,9 @@ odoo-developer-assistant/
 ## Limitations
 
 - Error analysis is based on recognizable text patterns and is not a confirmed diagnosis.
-- Dependency inspection only checks the supplied addon directories.
 - Manifest validation does not guarantee that an addon will install successfully in Odoo.
 - XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
 - Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
-- Security analysis is static. It verifies CSV access rule syntax, model ID prefixes, and XML record rule definitions, but does not confirm whether referenced security groups exist in an active Odoo database.
 - The unified addon health check performs static analysis across files; complete behavioral verification requires testing the addon inside an active Odoo runtime environment.
 - The tools do not modify an Odoo database (live inspection via `verify_odoo_live_metadata` is strictly read-only).
 

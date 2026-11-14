@@ -307,11 +307,21 @@ def inspect_odoo_module(
             dependency_status[dependency] = {
                 "status": "found",
                 "found_in": found_in,
+                "is_standard": dependency in ODOO_STANDARD_MODULES,
+            }
+        elif dependency in ODOO_STANDARD_MODULES:
+            edition = "enterprise" if dependency in KNOWN_ENTERPRISE_MODULES else "community"
+            dependency_status[dependency] = {
+                "status": "standard_odoo_core",
+                "found_in": ["odoo_core"],
+                "edition": edition,
+                "is_standard": True,
             }
         else:
             dependency_status[dependency] = {
                 "status": "not found in supplied directories",
                 "found_in": [],
+                "is_standard": False,
             }
 
     return {
@@ -1745,6 +1755,25 @@ def analyze_odoo_security(
                     "line": line_num,
                     "rule": row_id,
                 })
+            else:
+                is_std_group = row_group in ODOO_STANDARD_SECURITY_GROUPS
+                group_prefix = row_group.split(".")[0] if "." in row_group else ""
+                std_prefixes = {
+                    "base", "sales_team", "account", "stock", "purchase", "hr",
+                    "hr_expense", "hr_holidays", "hr_timesheet", "mrp",
+                    "point_of_sale", "helpdesk", "crm", "project", "website"
+                }
+                if not is_std_group and group_prefix in std_prefixes:
+                    close = difflib.get_close_matches(row_group, list(ODOO_STANDARD_SECURITY_GROUPS), n=1, cutoff=0.6)
+                    hint = f" Did you mean '{close[0]}'?" if close else ""
+                    warnings.append({
+                        "code": "UNRECOGNIZED_SECURITY_GROUP",
+                        "message": (
+                            f"Security group '{row_group}' is not a recognized standard Odoo group.{hint}"
+                        ),
+                        "line": line_num,
+                        "element": "group_id:id",
+                    })
 
             rules_found.append({
                 "id": row_id,
@@ -1877,10 +1906,26 @@ def check_odoo_addon_health(
 
             for dep in deps:
                 found_in = [str(r) for r in roots if (r / dep).is_dir()]
-                dep_status[dep] = {
-                    "status": "found" if found_in else "not found in supplied directories",
-                    "found_in": found_in,
-                }
+                if found_in:
+                    dep_status[dep] = {
+                        "status": "found",
+                        "found_in": found_in,
+                        "is_standard": dep in ODOO_STANDARD_MODULES,
+                    }
+                elif dep in ODOO_STANDARD_MODULES:
+                    edition = "enterprise" if dep in KNOWN_ENTERPRISE_MODULES else "community"
+                    dep_status[dep] = {
+                        "status": "standard_odoo_core",
+                        "found_in": ["odoo_core"],
+                        "edition": edition,
+                        "is_standard": True,
+                    }
+                else:
+                    dep_status[dep] = {
+                        "status": "not found in supplied directories",
+                        "found_in": [],
+                        "is_standard": False,
+                    }
             dep_info = {
                 "checked": True,
                 "dependency_status": dep_status,
@@ -2989,6 +3034,122 @@ KNOWN_ENTERPRISE_MODULES = {
     "web_grid",
     "web_map",
     "web_studio",
+}
+
+ODOO_STANDARD_COMMUNITY_MODULES = {
+    "account", "account_check_printing", "account_debit_note", "account_edi",
+    "account_payment", "account_qr_code_sepa", "analytic", "auth_ldap",
+    "auth_oauth", "auth_password_policy", "auth_signup", "auth_totp",
+    "barcodes", "base", "base_address_extended", "base_automation",
+    "base_geolocalize", "base_import", "base_import_module", "base_install_request",
+    "base_setup", "base_vat", "board", "bus", "calendar", "contacts",
+    "crm", "crm_iap_enrich", "crm_iap_mine", "crm_livechat", "crm_sms",
+    "digest", "event", "event_crm", "event_crm_sale", "event_sale", "event_sms",
+    "fetchmail", "fleet", "gamification", "google_account", "google_calendar",
+    "google_drive", "google_gmail", "google_recaptcha", "hr", "hr_attendance",
+    "hr_contract", "hr_expense", "hr_fleet", "hr_gamification", "hr_holidays",
+    "hr_homeworking", "hr_hourly_cost", "hr_org_chart", "hr_recruitment",
+    "hr_recruitment_skills", "hr_recruitment_survey", "hr_skills", "hr_timesheet",
+    "hr_timesheet_attendance", "http_routing", "hw_drivers", "iap", "iap_crm",
+    "iap_mail", "im_livechat", "im_livechat_mail_bot", "l10n_generic_coa",
+    "link_tracker", "lunch", "mail", "mail_bot", "mail_group", "mail_plugin",
+    "maintenance", "mass_mailing", "mass_mailing_crm", "mass_mailing_event",
+    "mass_mailing_sale", "mass_mailing_sms", "mass_mailing_themes", "membership",
+    "microsoft_account", "microsoft_calendar", "microsoft_outlook", "mrp",
+    "mrp_account", "mrp_subcontracting", "note", "onboarding", "pad",
+    "partner_autocomplete", "payment", "payment_custom", "phone_validation",
+    "point_of_sale", "portal", "portal_rating", "pos_discount", "pos_epson_printer",
+    "pos_hr", "pos_mercury", "pos_restaurant", "pos_sale", "pos_six", "privacy_lookup",
+    "procurement_jit", "product", "product_email_template", "product_expiry",
+    "product_images", "product_margin", "product_matrix", "product_unspsc",
+    "project", "project_account", "project_hr_expense", "project_hr_skills",
+    "project_mail_plugin", "project_mrp", "project_purchase", "project_sale_expense",
+    "project_sms", "project_todo", "purchase", "purchase_mrp", "purchase_product_matrix",
+    "purchase_requisition", "purchase_requisition_stock", "purchase_stock", "rating",
+    "repair", "resource", "sale", "sale_crm", "sale_expense", "sale_management",
+    "sale_margin", "sale_mrp", "sale_pdf_quote_builder", "sale_product_configurator",
+    "sale_product_matrix", "sale_project", "sale_purchase", "sale_purchase_stock",
+    "sale_sms", "sale_stock", "sale_timesheet", "sales_team", "sms", "snailmail",
+    "snailmail_account", "stock", "stock_account", "stock_delivery", "stock_dropshipping",
+    "stock_landed_costs", "stock_picking_batch", "stock_sms", "survey",
+    "transifex", "uom", "utm", "web", "web_editor", "web_tour", "web_unsplash",
+    "website", "website_blog", "website_crm", "website_crm_iap_reveal",
+    "website_crm_livechat", "website_crm_partner_assign", "website_crm_sms",
+    "website_customer", "website_event", "website_event_crm", "website_event_questions",
+    "website_event_sale", "website_event_track", "website_form_project", "website_forum",
+    "website_google_map", "website_hr_recruitment", "website_links", "website_livechat",
+    "website_mail", "website_mail_group", "website_mass_mailing", "website_membership",
+    "website_partner", "website_payment", "website_sale", "website_sale_comparison",
+    "website_sale_coupon", "website_sale_digital", "website_sale_loyalty",
+    "website_sale_mondialrelay", "website_sale_picking", "website_sale_product_configurator",
+    "website_sale_slides", "website_sale_stock", "website_sale_stock_renting",
+    "website_sale_wishlist", "website_slides", "website_slides_forum", "website_slides_survey",
+    "website_sms",
+}
+
+ODOO_STANDARD_MODULES = ODOO_STANDARD_COMMUNITY_MODULES | KNOWN_ENTERPRISE_MODULES
+
+ODOO_STANDARD_SECURITY_GROUPS = {
+    # Base / Administration
+    "base.group_user",
+    "base.group_system",
+    "base.group_erp_manager",
+    "base.group_portal",
+    "base.group_public",
+    "base.group_no_one",
+    "base.group_multi_company",
+    "base.group_multi_currency",
+    "base.group_partner_manager",
+    # Sales & CRM
+    "sales_team.group_sale_salesman",
+    "sales_team.group_sale_salesman_all_leads",
+    "sales_team.group_sale_manager",
+    "crm.group_use_lead",
+    # Accounting
+    "account.group_account_readonly",
+    "account.group_account_invoice",
+    "account.group_account_user",
+    "account.group_account_manager",
+    # Stock / Inventory
+    "stock.group_stock_user",
+    "stock.group_stock_manager",
+    "stock.group_stock_multi_locations",
+    "stock.group_stock_multi_warehouses",
+    "stock.group_tracking_lot",
+    "stock.group_production_lot",
+    "stock.group_adv_location",
+    # Purchase
+    "purchase.group_purchase_user",
+    "purchase.group_purchase_manager",
+    "purchase.group_warning_purchase",
+    # Project & Timesheet
+    "project.group_project_user",
+    "project.group_project_manager",
+    "project.group_project_stages",
+    "hr_timesheet.group_hr_timesheet_user",
+    "hr_timesheet.group_hr_timesheet_approver",
+    # HR & Expense
+    "hr.group_hr_user",
+    "hr.group_hr_manager",
+    "hr_expense.group_hr_expense_user",
+    "hr_expense.group_hr_expense_manager",
+    "hr_holidays.group_hr_holidays_user",
+    "hr_holidays.group_hr_holidays_manager",
+    "hr_attendance.group_hr_attendance_user",
+    "hr_attendance.group_hr_attendance_manager",
+    # Manufacturing
+    "mrp.group_mrp_user",
+    "mrp.group_mrp_manager",
+    "mrp.group_mrp_routings",
+    # Point of Sale
+    "point_of_sale.group_pos_user",
+    "point_of_sale.group_pos_manager",
+    # Helpdesk
+    "helpdesk.group_helpdesk_user",
+    "helpdesk.group_helpdesk_manager",
+    # Website / e-Commerce
+    "website.group_website_publisher",
+    "website.group_website_designer",
 }
 
 

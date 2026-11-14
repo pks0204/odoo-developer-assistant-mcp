@@ -3160,3 +3160,69 @@ def test_cli_fix_command(tmp_path: Path, capsys):
 
     code_check_fix = cli_main(["check", str(addon), "--fix", "--apply"])
     assert code_check_fix == 0
+
+
+def test_inspect_odoo_module_recognizes_standard_core_modules(tmp_path: Path):
+    manifest = {
+        "name": "Standard Core Test",
+        "version": "19.0.1.0.0",
+        "depends": ["base", "sale", "helpdesk", "non_existent_custom_module"],
+    }
+    addon = create_addon(tmp_path, manifest)
+
+    result = inspect_odoo_module(
+        addon_path=str(addon),
+        addons_directories=[str(tmp_path)],
+    )
+
+    assert result["success"] is True
+    dep_stat = result["dependency_status"]
+
+    # Base and sale are standard Odoo Community core
+    assert dep_stat["base"]["status"] == "standard_odoo_core"
+    assert dep_stat["base"]["is_standard"] is True
+    assert dep_stat["base"]["edition"] == "community"
+
+    assert dep_stat["sale"]["status"] == "standard_odoo_core"
+    assert dep_stat["sale"]["edition"] == "community"
+
+    # Helpdesk is standard Odoo Enterprise
+    assert dep_stat["helpdesk"]["status"] == "standard_odoo_core"
+    assert dep_stat["helpdesk"]["edition"] == "enterprise"
+
+    # Non-existent custom module is flagged as missing from supplied directories
+    assert dep_stat["non_existent_custom_module"]["status"] == "not found in supplied directories"
+    assert dep_stat["non_existent_custom_module"]["is_standard"] is False
+
+
+def test_analyze_security_validates_standard_security_groups(tmp_path: Path):
+    csv_file = tmp_path / "ir.model.access.csv"
+    csv_file.write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_test_order_user,access.test.order.user,model_test_order,base.group_user,1,1,1,1\n"
+        "access_test_order_mgr,access.test.order.mgr,model_test_order,sales_team.group_sale_manager,1,1,1,1\n",
+        encoding="utf-8",
+    )
+
+    result = analyze_odoo_security(str(csv_file))
+    assert result["success"] is True
+    assert result["valid"] is True
+    assert len(result["errors"]) == 0
+    # No unrecognized group warnings
+    unrec_warnings = [w for w in result["warnings"] if w["code"] == "UNRECOGNIZED_SECURITY_GROUP"]
+    assert len(unrec_warnings) == 0
+
+
+def test_analyze_security_warns_on_typo_security_group_with_suggestion(tmp_path: Path):
+    csv_file = tmp_path / "ir.model.access.csv"
+    csv_file.write_text(
+        "id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink\n"
+        "access_test_order,access.test.order,model_test_order,base.group_userr,1,1,1,1\n",
+        encoding="utf-8",
+    )
+
+    result = analyze_odoo_security(str(csv_file))
+    assert result["success"] is True
+    unrec_warnings = [w for w in result["warnings"] if w["code"] == "UNRECOGNIZED_SECURITY_GROUP"]
+    assert len(unrec_warnings) == 1
+    assert "Did you mean 'base.group_user'?" in unrec_warnings[0]["message"]
