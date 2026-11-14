@@ -3450,3 +3450,386 @@ def test_addon_health_detects_circular_dependencies(tmp_path):
     circ_errors = [e for e in result["errors"] if e.get("code") == "CIRCULAR_DEPENDENCY"]
     assert len(circ_errors) > 0
     assert "mod_a -> mod_b -> mod_a" in circ_errors[0]["message"]
+
+
+# --------------------------------------------------
+# Phase 4 Tests: Batch Live Metadata & DB Verifier
+# --------------------------------------------------
+
+def test_verify_live_metadata_with_addon_path(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "Live Verify Addon",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "data": ["views/property_views.xml"],
+        },
+    )
+    models_dir = addon / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    (models_dir / "property.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class EstateProperty(models.Model):\n"
+        "    _name = 'estate.property'\n"
+        "    _description = 'Property'\n"
+        "    partner_id = fields.Many2one('res.partner', string='Buyer')\n",
+        encoding="utf-8",
+    )
+    views_dir = addon / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    (views_dir / "property_views.xml").write_text(
+        "<odoo>\n"
+        "  <record id='view_property_form' model='ir.ui.view'>\n"
+        "    <field name='name'>estate.property.form</field>\n"
+        "    <field name='model'>estate.property</field>\n"
+        "    <field name='arch' type='xml'>\n"
+        "      <form>\n"
+        "        <field name='partner_id' groups='base.group_user'/>\n"
+        "      </form>\n"
+        "    </field>\n"
+        "  </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        def mock_execute_kw(db, uid, pwd, model, method, args, kwargs=None):
+            if model == "ir.model":
+                return [
+                    {"model": "estate.property", "name": "Property", "state": "manual"},
+                    {"model": "res.partner", "name": "Contact", "state": "base"},
+                ]
+            elif model == "ir.model.fields":
+                return [
+                    {"name": "partner_id", "ttype": "many2one", "field_description": "Buyer", "required": False, "readonly": False}
+                ]
+            elif model == "ir.model.data":
+                return [
+                    {"module": "base", "name": "group_user", "model": "res.groups", "res_id": 1}
+                ]
+            return []
+
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.side_effect = mock_execute_kw
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="test_db",
+            username="admin",
+            password="secret_password",
+            addon_path=str(addon),
+        )
+
+        assert result["success"] is True
+        assert result["authenticated"] is True
+        assert result["summary"]["missing_models"] == 0
+        assert result["summary"]["missing_fields"] == 0
+        assert result["summary"]["missing_xml_ids"] == 0
+        assert result["models"]["res.partner"]["exists"] is True
+        assert result["fields"]["estate.property"]["partner_id"]["exists"] is True
+        assert result["xml_ids"]["base.group_user"]["exists"] is True
+
+
+def test_verify_live_metadata_batch_chunking_for_large_xml_ids():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        calls = []
+
+        def mock_execute_kw(db, uid, pwd, model, method, args, kwargs=None):
+            if model == "ir.model.data":
+                calls.append(args[0])
+                # Return dummy match for each
+                return [{"module": "mod", "name": f"rec_{i}", "model": "m", "res_id": i} for i in range(len(args[0]))]
+            return []
+
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.side_effect = mock_execute_kw
+
+        # 95 XML IDs -> with CHUNK_SIZE=40, should result in 3 chunks (40, 40, 15)
+        large_xml_ids = [f"mod.rec_{i}" for i in range(95)]
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="test_db",
+            username="admin",
+            password="secret_password",
+            xml_ids_to_check=large_xml_ids,
+        )
+
+        assert result["success"] is True
+        assert len(calls) == 3  # 3 chunked search_read calls instead of 1 giant query
+
+
+def test_addon_health_with_live_connection_detects_missing_metadata(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "Live Health Addon",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "data": ["views/missing_ref_view.xml"],
+        },
+    )
+    views_dir = addon / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    (views_dir / "missing_ref_view.xml").write_text(
+        "<odoo>\n"
+        "  <record id='view_custom_ref' model='ir.ui.view'>\n"
+        "    <field name='name'>ghost.model.form</field>\n"
+        "    <field name='model'>ghost.model</field>\n"
+        "    <field name='arch' type='xml'>\n"
+        "      <form>\n"
+        "        <field name='missing_live_field'/>\n"
+        "      </form>\n"
+        "    </field>\n"
+        "  </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        object_mock = mock_proxy.return_value
+        # Return empty list -> ghost.model and missing_live_field do not exist in live DB
+        object_mock.execute_kw.return_value = []
+
+        result = check_odoo_addon_health(
+            str(addon),
+            live_connection={
+                "url": "http://localhost:8069",
+                "db": "live_odoo_db",
+                "username": "admin",
+                "password": "admin_password",
+            },
+        )
+
+        assert result["success"] is True
+        assert result["audit_breakdown"]["live_verification"]["authenticated"] is True
+        live_errors = [e for e in result["errors"] if e.get("code") in ("LIVE_MISSING_MODEL", "LIVE_MISSING_FIELD")]
+        assert len(live_errors) > 0
+        assert result["health_status"] == "CRITICAL_ISSUES"
+
+
+def test_cli_check_with_live_connection(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "CLI Live Addon",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+        },
+    )
+
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.return_value = []
+
+        live_conn = {
+            "url": "http://localhost:8069",
+            "db": "cli_db",
+            "username": "admin",
+            "password": "password",
+        }
+        code = cli_check(str(addon), live_conn=live_conn)
+        assert code == 0
+
+
+# --------------------------------------------------
+# Phase 4 Tests: Batch Live Metadata & DB Verifier
+# --------------------------------------------------
+
+def test_verify_live_metadata_with_addon_path(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "Live Verify Addon",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "data": ["views/property_views.xml"],
+        },
+    )
+    models_dir = addon / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    (models_dir / "property.py").write_text(
+        "from odoo import models, fields\n\n"
+        "class EstateProperty(models.Model):\n"
+        "    _name = 'estate.property'\n"
+        "    _description = 'Property'\n"
+        "    partner_id = fields.Many2one('res.partner', string='Buyer')\n",
+        encoding="utf-8",
+    )
+    views_dir = addon / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    (views_dir / "property_views.xml").write_text(
+        "<odoo>\n"
+        "  <record id='view_property_form' model='ir.ui.view'>\n"
+        "    <field name='name'>estate.property.form</field>\n"
+        "    <field name='model'>estate.property</field>\n"
+        "    <field name='arch' type='xml'>\n"
+        "      <form>\n"
+        "        <field name='partner_id' groups='base.group_user'/>\n"
+        "      </form>\n"
+        "    </field>\n"
+        "  </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        def mock_execute_kw(db, uid, pwd, model, method, args, kwargs=None):
+            if model == "ir.model":
+                return [
+                    {"model": "estate.property", "name": "Property", "state": "manual"},
+                    {"model": "res.partner", "name": "Contact", "state": "base"},
+                ]
+            elif model == "ir.model.fields":
+                return [
+                    {"name": "partner_id", "ttype": "many2one", "field_description": "Buyer", "required": False, "readonly": False}
+                ]
+            elif model == "ir.model.data":
+                return [
+                    {"module": "base", "name": "group_user", "model": "res.groups", "res_id": 1}
+                ]
+            return []
+
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.side_effect = mock_execute_kw
+
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="test_db",
+            username="admin",
+            password="secret_password",
+            addon_path=str(addon),
+        )
+
+        assert result["success"] is True
+        assert result["authenticated"] is True
+        assert result["summary"]["missing_models"] == 0
+        assert result["summary"]["missing_fields"] == 0
+        assert result["summary"]["missing_xml_ids"] == 0
+        assert result["models"]["res.partner"]["exists"] is True
+        assert result["fields"]["estate.property"]["partner_id"]["exists"] is True
+        assert result["xml_ids"]["base.group_user"]["exists"] is True
+
+
+def test_verify_live_metadata_batch_chunking_for_large_xml_ids():
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        calls = []
+
+        def mock_execute_kw(db, uid, pwd, model, method, args, kwargs=None):
+            if model == "ir.model.data":
+                calls.append(args[0])
+                # Return dummy match for each
+                return [{"module": "mod", "name": f"rec_{i}", "model": "m", "res_id": i} for i in range(len(args[0]))]
+            return []
+
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.side_effect = mock_execute_kw
+
+        # 95 XML IDs -> with CHUNK_SIZE=40, should result in 3 chunks (40, 40, 15)
+        large_xml_ids = [f"mod.rec_{i}" for i in range(95)]
+        result = verify_odoo_live_metadata(
+            url="http://localhost:8069",
+            db="test_db",
+            username="admin",
+            password="secret_password",
+            xml_ids_to_check=large_xml_ids,
+        )
+
+        assert result["success"] is True
+        assert len(calls) == 3  # 3 chunked search_read calls instead of 1 giant query
+
+
+def test_addon_health_with_live_connection_detects_missing_metadata(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "Live Health Addon",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+            "data": ["views/missing_ref_view.xml"],
+        },
+    )
+    views_dir = addon / "views"
+    views_dir.mkdir(parents=True, exist_ok=True)
+    (views_dir / "missing_ref_view.xml").write_text(
+        "<odoo>\n"
+        "  <record id='view_custom_ref' model='ir.ui.view'>\n"
+        "    <field name='name'>ghost.model.form</field>\n"
+        "    <field name='model'>ghost.model</field>\n"
+        "    <field name='arch' type='xml'>\n"
+        "      <form>\n"
+        "        <field name='missing_live_field'/>\n"
+        "      </form>\n"
+        "    </field>\n"
+        "  </record>\n"
+        "</odoo>\n",
+        encoding="utf-8",
+    )
+
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+
+        object_mock = mock_proxy.return_value
+        # Return empty list -> ghost.model and missing_live_field do not exist in live DB
+        object_mock.execute_kw.return_value = []
+
+        result = check_odoo_addon_health(
+            str(addon),
+            live_connection={
+                "url": "http://localhost:8069",
+                "db": "live_odoo_db",
+                "username": "admin",
+                "password": "admin_password",
+            },
+        )
+
+        assert result["success"] is True
+        assert result["audit_breakdown"]["live_verification"]["authenticated"] is True
+        live_errors = [e for e in result["errors"] if e.get("code") in ("LIVE_MISSING_MODEL", "LIVE_MISSING_FIELD")]
+        assert len(live_errors) > 0
+        assert result["health_status"] == "CRITICAL_ISSUES"
+
+
+def test_cli_check_with_live_connection(tmp_path):
+    addon = create_addon(
+        tmp_path,
+        {
+            "name": "CLI Live Addon",
+            "version": "18.0.1.0.0",
+            "depends": ["base"],
+        },
+    )
+
+    with patch("server._get_server_proxy") as mock_proxy:
+        common_mock = mock_proxy.return_value
+        common_mock.authenticate.return_value = 2
+        object_mock = mock_proxy.return_value
+        object_mock.execute_kw.return_value = []
+
+        live_conn = {
+            "url": "http://localhost:8069",
+            "db": "cli_db",
+            "username": "admin",
+            "password": "password",
+        }
+        code = cli_check(str(addon), live_conn=live_conn)
+        assert code == 0
+

@@ -1,5 +1,6 @@
 import argparse
 import ast
+from collections import defaultdict
 import csv
 import datetime
 import difflib
@@ -1027,6 +1028,17 @@ class _OdooXMLContentHandler(xml.sax.ContentHandler):
                     "element": name,
                 })
 
+        # Collect group references in groups attributes
+        if "groups" in attrs:
+            for grp in attrs["groups"].split(","):
+                grp_clean = grp.strip()
+                if grp_clean and not grp_clean.startswith("!"):
+                    self.refs.append({
+                        "ref": grp_clean,
+                        "line": line,
+                        "element": name,
+                    })
+
         if name == "record":
             rec_id = attrs.get("id")
             rec_model = attrs.get("model")
@@ -1379,6 +1391,7 @@ def analyze_odoo_xml_view(
             for r in handler.records
             if r.get("model") == "ir.ui.view"
         ],
+        "external_id_references": [r["ref"] for r in handler.refs if r.get("ref")],
         "errors": errors,
         "warnings": warnings,
         "info": info,
@@ -1650,13 +1663,22 @@ def analyze_odoo_python_model(
                             if stmt.targets and isinstance(stmt.targets[0], ast.Name)
                             else "unknown"
                         )
+                        args = stmt.value.args
+                        keywords = {kw.arg: kw.value for kw in stmt.value.keywords if kw.arg}
+
+                        comodel_name = None
+                        if field_type in ("Many2one", "One2many", "Many2many"):
+                            if len(args) >= 1 and isinstance(args[0], ast.Constant) and isinstance(args[0].value, str):
+                                comodel_name = args[0].value
+                            elif "comodel_name" in keywords and isinstance(keywords["comodel_name"], ast.Constant) and isinstance(keywords["comodel_name"].value, str):
+                                comodel_name = keywords["comodel_name"].value
+
                         class_fields.append({
                             "name": field_name,
                             "type": field_type,
                             "line": stmt.lineno,
+                            "comodel": comodel_name,
                         })
-                        args = stmt.value.args
-                        keywords = {kw.arg: kw.value for kw in stmt.value.keywords if kw.arg}
 
                         # Relational field validations
                         if field_type == "Many2one":
@@ -2276,6 +2298,7 @@ ODOO_BASE_FIELDS = {
 def check_odoo_addon_health(
     addon_path: str,
     addons_directories: list[str] | None = None,
+    live_connection: dict | None = None,
 ) -> dict:
     """Run a comprehensive static health audit for an entire Odoo addon directory,
     evaluating the manifest, dependencies, XML views, Python models, and security rules.
@@ -2543,6 +2566,56 @@ def check_odoo_addon_health(
     cross_file_errors = [i for i in cross_file_issues if i.get("severity") == "error"]
     cross_file_warnings = [i for i in cross_file_issues if i.get("severity") == "warning"]
 
+    suggestions = []
+
+    # 6. Live metadata verification (if live_connection provided)
+    live_info = {"checked": False}
+    live_errors = []
+    if live_connection and isinstance(live_connection, dict):
+        url = live_connection.get("url")
+        db = live_connection.get("db")
+        username = live_connection.get("username")
+        password = live_connection.get("password")
+        timeout = live_connection.get("timeout", 10)
+        if url and db and username and password:
+            live_res = verify_odoo_live_metadata(
+                url=url,
+                db=db,
+                username=username,
+                password=password,
+                addon_path=str(resolved_addon),
+                timeout=timeout,
+            )
+            live_info = live_res
+            if live_res.get("success") and live_res.get("authenticated"):
+                for m, stat in live_res.get("models", {}).items():
+                    if isinstance(stat, dict) and not stat.get("exists") and "error" not in stat:
+                        live_errors.append({
+                            "file": "live_odoo_instance",
+                            "code": "LIVE_MISSING_MODEL",
+                            "message": f"Referenced model '{m}' does not exist in active Odoo database '{db}'.",
+                        })
+                for m, f_dict in live_res.get("fields", {}).items():
+                    if isinstance(f_dict, dict) and "error" not in f_dict:
+                        for fn, f_stat in f_dict.items():
+                            if isinstance(f_stat, dict) and not f_stat.get("exists"):
+                                live_errors.append({
+                                    "file": "live_odoo_instance",
+                                    "code": "LIVE_MISSING_FIELD",
+                                    "message": f"Referenced field '{fn}' on model '{m}' does not exist in active Odoo database '{db}'.",
+                                })
+                for xid, x_stat in live_res.get("xml_ids", {}).items():
+                    if isinstance(x_stat, dict) and not x_stat.get("exists") and "error" not in x_stat:
+                        live_errors.append({
+                            "file": "live_odoo_instance",
+                            "code": "LIVE_MISSING_XML_ID",
+                            "message": f"Referenced external XML ID '{xid}' does not exist in active Odoo database '{db}'.",
+                        })
+                if not live_errors:
+                    suggestions.append(
+                        f"All referenced models, fields, and external XML IDs were confirmed in active Odoo database '{db}'."
+                    )
+
     # Aggregates
     manifest_valid = manifest_res.get("valid", True)
     missing_ext_count = len(manifest_res.get("missing_external_dependencies", []))
@@ -2573,6 +2646,7 @@ def check_odoo_addon_health(
         + models_errors_count
         + sec_errors_count
         + len(cross_file_errors)
+        + len(live_errors)
     )
     total_warnings = (
         load_order_warnings_count
@@ -2593,7 +2667,6 @@ def check_odoo_addon_health(
     else:
         health_status = "HEALTHY"
 
-    suggestions = []
     if not manifest_valid:
         suggestions.extend(manifest_res.get("suggestions", []))
     if missing_ext_count > 0:
@@ -2668,6 +2741,8 @@ def check_odoo_addon_health(
         else:
             all_warnings.append(item)
 
+    all_errors.extend(live_errors)
+
     return {
         "success": True,
         "addon_name": resolved_addon.name,
@@ -2696,6 +2771,7 @@ def check_odoo_addon_health(
             "views": views_audit,
             "models": models_audit,
             "security": security_audit,
+            "live_verification": live_info,
             "cross_file_consistency": {
                 "issues": cross_file_issues,
                 "total_issues": len(cross_file_issues),
@@ -2733,6 +2809,86 @@ def _get_server_proxy(endpoint: str, timeout: int = 10) -> xmlrpc.client.ServerP
     return xmlrpc.client.ServerProxy(endpoint, transport=transport, allow_none=True)
 
 
+def _extract_addon_metadata_for_live_verification(
+    addon_path: Path,
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    """Extract all referenced models, view fields, and external XML IDs from an addon for live DB checking."""
+    models = set()
+    fields_by_model = defaultdict(set)
+    xml_ids = set()
+
+    # 1. Parse XML view and data files
+    for xml_file in sorted(addon_path.glob("**/*.xml")):
+        if (
+            xml_file.name.startswith(".")
+            or "tests" in xml_file.parts
+            or "migrations" in xml_file.parts
+            or "_migration_backups" in xml_file.parts
+        ):
+            continue
+        try:
+            res = analyze_odoo_xml_view(str(xml_file), addon_path=str(addon_path))
+            for v in res.get("views_found", []):
+                tm = v.get("target_model")
+                if tm:
+                    models.add(tm)
+                    for f in v.get("arch_fields", []):
+                        if f not in ODOO_BASE_FIELDS:
+                            fields_by_model[tm].add(f)
+            for ref in res.get("external_id_references", []):
+                if ref and isinstance(ref, str) and "." in ref:
+                    xml_ids.add(ref.strip())
+        except Exception:
+            continue
+
+    # 2. Parse Python models
+    for py_file in sorted(addon_path.glob("**/*.py")):
+        if (
+            py_file.name.startswith(".")
+            or "tests" in py_file.parts
+            or "migrations" in py_file.parts
+            or "_migration_backups" in py_file.parts
+            or py_file.name in ("__manifest__.py", "__init__.py")
+        ):
+            continue
+        try:
+            res = analyze_odoo_python_model(str(py_file), addon_path=str(addon_path))
+            for m in res.get("models_found", []):
+                if m.get("name"):
+                    models.add(m["name"])
+                inherit = m.get("inherit")
+                if inherit:
+                    if isinstance(inherit, list):
+                        for inh in inherit:
+                            if isinstance(inh, str) and inh.strip():
+                                models.add(inh.strip())
+                    elif isinstance(inherit, str) and inherit.strip():
+                        models.add(inherit.strip())
+                for f in m.get("field_definitions", []):
+                    comodel = f.get("comodel")
+                    if comodel and isinstance(comodel, str) and comodel.strip():
+                        models.add(comodel.strip())
+        except Exception:
+            continue
+
+    # 3. Parse security CSV files
+    for csv_file in sorted(addon_path.glob("**/ir.model.access.csv")):
+        try:
+            res = analyze_odoo_security(str(csv_file), addon_path=str(addon_path))
+            for r in res.get("rules_found", []):
+                grp = r.get("group")
+                if grp and isinstance(grp, str) and grp.strip() and "." in grp:
+                    xml_ids.add(grp.strip())
+        except Exception:
+            continue
+
+    return (
+        sorted(list(models)),
+        {m: sorted(list(fs)) for m, fs in sorted(fields_by_model.items()) if fs},
+        sorted(list(xml_ids)),
+    )
+
+
 @mcp.tool()
 def verify_odoo_live_metadata(
     url: str,
@@ -2742,6 +2898,7 @@ def verify_odoo_live_metadata(
     models_to_check: list[str] | None = None,
     fields_to_check: dict[str, list[str]] | None = None,
     xml_ids_to_check: list[str] | None = None,
+    addon_path: str | None = None,
     timeout: int = 10,
 ) -> dict:
     """Connect to a running Odoo instance via read-only XML-RPC to dynamically
@@ -2755,6 +2912,7 @@ def verify_odoo_live_metadata(
         models_to_check: Optional list of model names to verify (e.g. ['sale.order', 'res.partner']).
         fields_to_check: Optional mapping of model names to lists of field names to verify (e.g. {'sale.order': ['partner_id', 'custom_ref']}).
         xml_ids_to_check: Optional list of external XML IDs to verify (e.g. ['base.group_user', 'sale.action_orders']).
+        addon_path: Optional path to an addon directory to automatically extract and verify all models, fields, and XML IDs in batch.
         timeout: Network timeout in seconds (default: 10).
     """
     if not isinstance(url, str) or not url.strip():
@@ -2812,6 +2970,41 @@ def verify_odoo_live_metadata(
             "success": False,
             "error": "xml_ids_to_check must be a list of XML ID strings.",
         }
+
+    if addon_path is not None and (not isinstance(addon_path, str) or not addon_path.strip()):
+        return {
+            "success": False,
+            "error": "addon_path must be a non-empty string path to an Odoo addon directory.",
+        }
+
+    if addon_path:
+        try:
+            resolved_addon = Path(addon_path).expanduser().resolve()
+            if not resolved_addon.is_dir():
+                return {
+                    "success": False,
+                    "error": f"Supplied addon_path does not exist or is not a directory: {addon_path}",
+                }
+            ext_models, ext_fields, ext_xml_ids = _extract_addon_metadata_for_live_verification(resolved_addon)
+
+            merged_models = set(models_to_check or []) | set(ext_models)
+            models_to_check = sorted(list(merged_models)) if merged_models else None
+
+            merged_fields = defaultdict(set)
+            if fields_to_check:
+                for m, fl in fields_to_check.items():
+                    merged_fields[m].update(fl)
+            for m, fl in ext_fields.items():
+                merged_fields[m].update(fl)
+            fields_to_check = {m: sorted(list(fl)) for m, fl in merged_fields.items()} if merged_fields else None
+
+            merged_xml_ids = set(xml_ids_to_check or []) | set(ext_xml_ids)
+            xml_ids_to_check = sorted(list(merged_xml_ids)) if merged_xml_ids else None
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": f"Failed to extract metadata from addon_path: {exc}",
+            }
 
     if not isinstance(timeout, (int, float)) or timeout <= 0 or timeout > 60:
         return {
@@ -2874,17 +3067,22 @@ def verify_odoo_live_metadata(
             "error": f"Failed to initialize object endpoint: {exc}",
         }
 
-    # 3. Query Models
+    # 3. Query Models (batch chunked for large schemas)
     models_status = {}
     if models_to_check:
         try:
-            records = models_proxy.execute_kw(
-                db.strip(), uid, password,
-                "ir.model", "search_read",
-                [[["model", "in", models_to_check]]],
-                {"fields": ["model", "name", "state"]},
-            )
-            found_dict = {r["model"]: r for r in records}
+            CHUNK_SIZE = 80
+            found_dict = {}
+            for i in range(0, len(models_to_check), CHUNK_SIZE):
+                chunk_models = models_to_check[i : i + CHUNK_SIZE]
+                records = models_proxy.execute_kw(
+                    db.strip(), uid, password,
+                    "ir.model", "search_read",
+                    [[["model", "in", chunk_models]]],
+                    {"fields": ["model", "name", "state"]},
+                )
+                for r in records:
+                    found_dict[r["model"]] = r
             for m in models_to_check:
                 if m in found_dict:
                     models_status[m] = {
@@ -2897,18 +3095,23 @@ def verify_odoo_live_metadata(
         except Exception as exc:
             models_status = {"error": f"Failed to query ir.model: {exc}"}
 
-    # 4. Query Fields
+    # 4. Query Fields (batch chunked per model)
     fields_status = {}
     if fields_to_check:
         for m_name, f_list in fields_to_check.items():
             try:
-                records = models_proxy.execute_kw(
-                    db.strip(), uid, password,
-                    "ir.model.fields", "search_read",
-                    [[["model", "=", m_name], ["name", "in", f_list]]],
-                    {"fields": ["name", "ttype", "field_description", "required", "readonly"]},
-                )
-                found_fields = {r["name"]: r for r in records}
+                CHUNK_SIZE = 80
+                found_fields = {}
+                for i in range(0, len(f_list), CHUNK_SIZE):
+                    chunk_fl = f_list[i : i + CHUNK_SIZE]
+                    records = models_proxy.execute_kw(
+                        db.strip(), uid, password,
+                        "ir.model.fields", "search_read",
+                        [[["model", "=", m_name], ["name", "in", chunk_fl]]],
+                        {"fields": ["name", "ttype", "field_description", "required", "readonly"]},
+                    )
+                    for r in records:
+                        found_fields[r["name"]] = r
                 field_res = {}
                 for fn in f_list:
                     if fn in found_fields:
@@ -2926,7 +3129,7 @@ def verify_odoo_live_metadata(
             except Exception as exc:
                 fields_status[m_name] = {"error": f"Failed to query fields for {m_name}: {exc}"}
 
-    # 5. Query External XML IDs
+    # 5. Query External XML IDs (chunked to prevent deep domain recursion crashes)
     xml_ids_status = {}
     if xml_ids_to_check:
         parsed_xml_ids = []
@@ -2940,25 +3143,28 @@ def verify_odoo_live_metadata(
             domain_clauses.append(["&", ["module", "=", mod_name], ["name", "=", rec_name]])
 
         try:
-            if len(domain_clauses) == 1:
-                combined_domain = domain_clauses[0]
-            else:
-                combined_domain = []
-                for _ in range(len(domain_clauses) - 1):
-                    combined_domain.append("|")
-                for clause in domain_clauses:
-                    combined_domain.extend(clause)
-
-            records = models_proxy.execute_kw(
-                db.strip(), uid, password,
-                "ir.model.data", "search_read",
-                [combined_domain],
-                {"fields": ["module", "name", "model", "res_id"]},
-            )
+            CHUNK_SIZE = 40
             found_xids = {}
-            for r in records:
-                full_key = f"{r['module']}.{r['name']}" if r["module"] else r["name"]
-                found_xids[full_key] = r
+            for i in range(0, len(domain_clauses), CHUNK_SIZE):
+                chunk_clauses = domain_clauses[i : i + CHUNK_SIZE]
+                if len(chunk_clauses) == 1:
+                    chunk_domain = chunk_clauses[0]
+                else:
+                    chunk_domain = []
+                    for _ in range(len(chunk_clauses) - 1):
+                        chunk_domain.append("|")
+                    for clause in chunk_clauses:
+                        chunk_domain.extend(clause)
+
+                records = models_proxy.execute_kw(
+                    db.strip(), uid, password,
+                    "ir.model.data", "search_read",
+                    [chunk_domain],
+                    {"fields": ["module", "name", "model", "res_id"]},
+                )
+                for r in records:
+                    full_key = f"{r['module']}.{r['name']}" if r["module"] else r["name"]
+                    found_xids[full_key] = r
 
             for xid, mod_name, rec_name in parsed_xml_ids:
                 full_key = f"{mod_name}.{rec_name}" if mod_name else rec_name
@@ -5628,6 +5834,15 @@ def format_cli_report(result: dict, title: str) -> str:
         for cf in cross_file:
             lines.append(f"  [CONSISTENCY] {cf.get('issue_type', '')}: {cf.get('message', str(cf))}")
 
+    live_ver = result.get("audit_breakdown", {}).get("live_verification") or result.get("live_verification")
+    if live_ver and isinstance(live_ver, dict) and live_ver.get("authenticated"):
+        l_sum = live_ver.get("summary", {})
+        lines.append(f"\nLive Database Verification ({live_ver.get('url')} / {live_ver.get('database')}):")
+        lines.append(f"  - Status: Authenticated (User ID: {live_ver.get('user_id')})")
+        lines.append(f"  - Models checked: {l_sum.get('models_checked', 0)} (Missing: {l_sum.get('missing_models', 0)})")
+        lines.append(f"  - Fields checked: {l_sum.get('fields_checked', 0)} (Missing: {l_sum.get('missing_fields', 0)})")
+        lines.append(f"  - External XML IDs checked: {l_sum.get('xml_ids_checked', 0)} (Missing: {l_sum.get('missing_xml_ids', 0)})")
+
     suggestions = result.get("suggestions", [])
     if suggestions:
         lines.append("\nSuggestions:")
@@ -5644,6 +5859,7 @@ def cli_check(
     addons_dirs: list[str] | None = None,
     fix: bool = False,
     apply: bool = False,
+    live_conn: dict | None = None,
 ) -> int:
     """Run static check on an addon directory or individual file."""
     if fix:
@@ -5662,7 +5878,7 @@ def cli_check(
     if target.is_dir():
         manifest_file = target / "__manifest__.py"
         if manifest_file.is_file():
-            res = check_odoo_addon_health(str(target), addons_directories=addons_dirs)
+            res = check_odoo_addon_health(str(target), addons_directories=addons_dirs, live_connection=live_conn)
             if not res.get("success"):
                 print(f"[ERROR] {res.get('error', 'Health check failed')}", file=sys.stderr)
                 return 2
@@ -5683,7 +5899,7 @@ def cli_check(
         if child_addons:
             overall_code = 0
             for child in child_addons:
-                c_res = check_odoo_addon_health(str(child), addons_directories=addons_dirs)
+                c_res = check_odoo_addon_health(str(child), addons_directories=addons_dirs, live_connection=live_conn)
                 if not c_res.get("success"):
                     print(f"[ERROR] {child.name}: {c_res.get('error')}", file=sys.stderr)
                     overall_code = 1
@@ -6007,6 +6223,10 @@ def cli_main(args: list[str] | None = None) -> int:
     check_p.add_argument("--addons-dir", action="append", dest="addons_dirs", help="Additional addons directory for dependency checks.")
     check_p.add_argument("--fix", action="store_true", help="Detect and automatically fix common Odoo issues.")
     check_p.add_argument("--apply", action="store_true", help="Explicitly give permission to write fixes to disk.")
+    check_p.add_argument("--live-url", help="Odoo server URL for live metadata verification (e.g. http://localhost:8069)")
+    check_p.add_argument("--live-db", help="Odoo database name")
+    check_p.add_argument("--live-user", help="Odoo username")
+    check_p.add_argument("--live-password", help="Odoo password or API key")
 
     fix_p = subparsers.add_parser("fix", help="Detect and automatically fix common Odoo issues with permission.")
     fix_p.add_argument("addon_path", help="Path to addon directory")
@@ -6036,12 +6256,21 @@ def cli_main(args: list[str] | None = None) -> int:
         return 0
 
     if parsed.command == "check":
+        live_conn = None
+        if parsed.live_url and parsed.live_db and parsed.live_user and parsed.live_password:
+            live_conn = {
+                "url": parsed.live_url,
+                "db": parsed.live_db,
+                "username": parsed.live_user,
+                "password": parsed.live_password,
+            }
         return cli_check(
             parsed.path,
             fail_on_warning=parsed.fail_on_warning,
             addons_dirs=parsed.addons_dirs,
             fix=parsed.fix,
             apply=parsed.apply,
+            live_conn=live_conn,
         )
     elif parsed.command == "fix":
         return cli_fix(parsed.addon_path, apply=parsed.apply, fix_types=parsed.fix_types)

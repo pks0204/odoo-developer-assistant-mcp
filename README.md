@@ -99,9 +99,12 @@ Capabilities include:
 The `verify_odoo_live_metadata` tool enables developers to connect to an active Odoo instance (local development Docker, test instance, or staging server) via read-only XML-RPC to dynamically verify models, fields, and external XML IDs before deployment.
 
 Capabilities include:
+- **Whole-Addon Batch Verification**: Supply an `addon_path` to automatically extract and verify all referenced models, relational comodels, view fields, and external XML IDs across the addon in a single operation.
+- **Enterprise Schema Batch Chunking**: Automatically chunks large query sets (40 XML IDs per domain batch, 80 models/fields per query) to prevent PostgreSQL and Odoo RPC recursion limit crashes on massive enterprise schemas with 1,000+ records.
 - **Model Verification**: Queries `ir.model` to check whether referenced models exist in the target database.
 - **Field Verification**: Queries `ir.model.fields` to verify that field names, types (`ttype`), and attributes exist on the target model.
 - **External XML ID Verification**: Queries `ir.model.data` to verify external IDs (e.g. `base.group_user`, `sale.action_orders`).
+- **Unified Health Check & CLI Integration**: Integrates directly with `check_odoo_addon_health(live_connection=...)` and CLI runner `--live-url`, `--live-db`, `--live-user`, `--live-password`.
 - **Read-Only Safety**: Strictly executes read-only `search_read` calls; never writes to or modifies the database.
 - **Credential Protection**: Passwords and API keys are never leaked or stored in responses.
 - **Zero Dependencies**: Powered exclusively by Python's standard library `xmlrpc.client`.
@@ -297,7 +300,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 172 tests covering error classification, traceback stack parsing, PostgreSQL constraint diagnostics, Owl 2 crash analysis, addon inspection, manifest pre-flight installation checks, external dependencies verification, sequential data load ordering diagnostics, circular module dependency detection, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
+The current test suite contains 176 tests covering error classification, traceback stack parsing, PostgreSQL constraint diagnostics, Owl 2 crash analysis, addon inspection, manifest pre-flight installation checks, external dependencies verification, sequential data load ordering diagnostics, circular module dependency detection, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, batch live metadata verification & enterprise schema query chunking, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -409,16 +412,14 @@ odoo-developer-assistant/
     └── test_server.py
 ```
 
-## Limitations
+## Operational Scope & Guarantees
 
-- XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
-- Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
-- The unified addon health check performs static analysis across files; complete behavioral verification requires testing the addon inside an active Odoo runtime environment.
-- The tools do not modify an Odoo database (live inspection via `verify_odoo_live_metadata` is strictly read-only).
+- **Static vs Live Verification**: When executed without an active Odoo instance, analysis is static and relies on AST parsing, structure validation, and standard module knowledge bases. When connected to a live database (via `verify_odoo_live_metadata` or `--live-url`), the assistant dynamically confirms model existence, database field presence, and external XML IDs in the target environment.
+- **Read-Only Safety**: The tools strictly do not modify an active Odoo database (live inspection via `verify_odoo_live_metadata` runs read-only `search_read` queries).
+- **Behavioral Testing**: Static checks and live schema audits verify structural and relational integrity; dynamic business logic execution is verified by running the automated unit test cases generated via `scaffold_odoo_tests`.
 
 ## Future Improvements
 
-- Support batch live metadata verification for large enterprise schemas.
 - Expand automated tests for unusual and edge-case inputs.
 
 ## License
