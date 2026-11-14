@@ -10,19 +10,14 @@ The project provides initial troubleshooting suggestions and static validation. 
 
 ### 1. Odoo Error Analyzer
 
-The `analyze_odoo_error` tool classifies common Odoo errors and suggests troubleshooting steps.
+The `analyze_odoo_error` tool analyzes Odoo runtime error tracebacks, PostgreSQL constraint violations, and Owl 2 browser crashes, delivering structured root-cause diagnoses and actionable code fixes.
 
-Currently recognized categories include:
-
-- XML ID errors
-- Access rights errors
-- OWL frontend errors
-- Database schema errors
-- XML data errors
-- Key and lookup errors
-- Generic RPC errors
-
-Unknown errors receive general troubleshooting guidance.
+Capabilities include:
+- **Full Traceback Stack Parsing**: Extracts the exact failing custom file, line number, method name, and code snippet, filtering out internal framework frames (`odoo/http.py`, `odoo/models.py`).
+- **PostgreSQL Database Constraint Violations**: Specifically diagnoses `NOT NULL` constraint violations (identifying exact column and table), duplicate key `UNIQUE` violations (extracting conflicting constraint, key, and duplicate value), and foreign key constraint failures.
+- **Modern Owl 2 & Web Client Errors**: Pinpoints unregistered Owl components, missing QWeb templates (`<t t-name="...">`), and component lifecycle scope errors (accessing `this.env` outside `setup()`).
+- **Asset Bundle Diagnostics**: Identifies broken SCSS variables, asset compiler errors, and missing bundle assets.
+- **Concrete Fix Recommendations**: Delivers actionable fix suggestions tailored to the exact failure point.
 
 ### 2. Odoo Module Inspector
 
@@ -304,7 +299,7 @@ From the project root:
 pytest -v
 ```
 
-The current test suite contains 161 tests covering error classification, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
+The current test suite contains 166 tests covering error classification, traceback stack parsing, PostgreSQL constraint diagnostics, Owl 2 crash analysis, addon inspection, manifest validation, XML view analysis, Python model analysis, security analysis, standard Odoo core modules & security groups resolution, cross-file consistency, live metadata verification, addon migration & OpenUpgrade scaffolding, modern OWL & JavaScript component analysis, automated OpenUpgrade script generation, automated test scaffolding, standalone CLI runner, git pre-commit hooks, automated code fixer with dry-run/permission safety, entry points, and edge cases.
 
 ## Client Configuration
 
@@ -418,7 +413,6 @@ odoo-developer-assistant/
 
 ## Limitations
 
-- Error analysis is based on recognizable text patterns and is not a confirmed diagnosis.
 - Manifest validation does not guarantee that an addon will install successfully in Odoo.
 - XML view analysis is static. It verifies syntax, structural conventions, and reference declarations, but does not guarantee that model fields or referenced external IDs exist in an active Odoo database.
 - Python model analysis is static. It inspects AST structure, required attributes, relational field declarations, and decorator syntax, but does not execute Python code or connect to an Odoo database.
@@ -427,7 +421,6 @@ odoo-developer-assistant/
 
 ## Future Improvements
 
-- Recognize additional Odoo error patterns and OWL UI tracebacks.
 - Support batch live metadata verification for large enterprise schemas.
 - Expand automated tests for unusual and edge-case inputs.
 

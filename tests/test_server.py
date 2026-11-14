@@ -3226,3 +3226,80 @@ def test_analyze_security_warns_on_typo_security_group_with_suggestion(tmp_path:
     unrec_warnings = [w for w in result["warnings"] if w["code"] == "UNRECOGNIZED_SECURITY_GROUP"]
     assert len(unrec_warnings) == 1
     assert "Did you mean 'base.group_user'?" in unrec_warnings[0]["message"]
+
+
+def test_analyze_error_not_null_constraint():
+    err = (
+        'psycopg2.errors.NotNullViolation: null value in column "partner_id" '
+        'of relation "sale_order" violates not-null constraint\n'
+        'DETAIL:  Failing row contains (12, null, draft).'
+    )
+    result = analyze_odoo_error(err)
+    assert result["success"] is True
+    assert result["category"] == "Database NOT NULL Constraint Error"
+    assert result["confirmed_diagnosis"] is True
+    assert result["extracted_details"]["column"] == "partner_id"
+    assert result["extracted_details"]["table"] == "sale_order"
+    assert "partner_id" in result["actionable_fix"]
+
+
+def test_analyze_error_unique_constraint():
+    err = (
+        'psycopg2.errors.UniqueViolation: duplicate key value violates unique constraint "custom_order_code_unique"\n'
+        'DETAIL:  Key (code)=(ORD-001) already exists.'
+    )
+    result = analyze_odoo_error(err)
+    assert result["success"] is True
+    assert result["category"] == "Database Unique Constraint Error"
+    assert result["confirmed_diagnosis"] is True
+    assert result["extracted_details"]["constraint"] == "custom_order_code_unique"
+    assert result["extracted_details"]["key"] == "code"
+    assert result["extracted_details"]["value"] == "ORD-001"
+    assert "ORD-001" in result["actionable_fix"]
+
+
+def test_analyze_error_foreign_key_constraint():
+    err = (
+        'psycopg2.errors.ForeignKeyViolation: insert or update on table "custom_ticket" '
+        'violates foreign key constraint "custom_ticket_team_id_fkey" on table "custom_ticket"'
+    )
+    result = analyze_odoo_error(err)
+    assert result["success"] is True
+    assert result["category"] == "Database Foreign Key Error"
+    assert result["confirmed_diagnosis"] is True
+    assert result["extracted_details"]["constraint"] == "custom_ticket_team_id_fkey"
+    assert result["extracted_details"]["table"] == "custom_ticket"
+
+
+def test_analyze_error_owl_unregistered_component():
+    err = 'OwlError: Missing or unregistered component "CustomDashboardWidget"'
+    result = analyze_odoo_error(err)
+    assert result["success"] is True
+    assert result["category"] == "Owl Component Registry Error"
+    assert result["confirmed_diagnosis"] is True
+    assert result["extracted_details"]["component"] == "CustomDashboardWidget"
+    assert "CustomDashboardWidget" in result["actionable_fix"]
+
+
+def test_analyze_error_python_traceback_extraction():
+    tb = (
+        'Traceback (most recent call last):\n'
+        '  File "/odoo/http.py", line 120, in dispatch\n'
+        '    result = self._handle_exception(e)\n'
+        '  File "/odoo/models.py", line 540, in write\n'
+        '    return super().write(vals)\n'
+        '  File "/home/pranav/custom_addons/sale_custom/models/sale_order.py", line 45, in action_confirm\n'
+        '    self.delivery_date = fields.Date.today()\n'
+        'AttributeError: \'SaleOrder\' object has no attribute \'delivery_date\''
+    )
+    result = analyze_odoo_error(tb)
+    assert result["success"] is True
+    assert "traceback_summary" in result
+    tb_summary = result["traceback_summary"]
+    assert tb_summary["total_frames"] == 3
+    assert tb_summary["originating_frame"] is not None
+    assert "sale_custom/models/sale_order.py" in tb_summary["originating_frame"]["file"]
+    assert tb_summary["originating_frame"]["line"] == 45
+    assert tb_summary["originating_frame"]["function"] == "action_confirm"
+    assert tb_summary["originating_frame"]["is_custom_code"] is True
+    assert tb_summary["exception_type"] == "AttributeError"

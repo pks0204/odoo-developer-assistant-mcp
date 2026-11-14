@@ -25,9 +25,72 @@ mcp = MCPServer(
 )
 
 
+def _parse_odoo_traceback(error_text: str) -> dict:
+    """Extract structured stack trace, originating custom frame, and exception details."""
+    frame_pattern = re.compile(
+        r'File "(?P<file>[^"]+)", line (?P<line>\d+), in (?P<func>[\w<>\.]+)\n(?:\s*(?P<code>[^\n]+))?'
+    )
+    frames = []
+    for match in frame_pattern.finditer(error_text):
+        f_path = match.group("file")
+        line = int(match.group("line"))
+        func = match.group("func")
+        code = (match.group("code") or "").strip()
+        is_custom = not (
+            "/odoo/addons/base/" in f_path
+            or "/odoo/models.py" in f_path
+            or "/odoo/fields.py" in f_path
+            or "/odoo/http.py" in f_path
+            or "/odoo/sql_db.py" in f_path
+            or "/odoo/api.py" in f_path
+            or "python3." in f_path
+            or "site-packages" in f_path
+        )
+        frames.append({
+            "file": f_path,
+            "line": line,
+            "function": func,
+            "code": code,
+            "is_custom_code": is_custom,
+        })
+
+    last_line = ""
+    for l in reversed(error_text.strip().splitlines()):
+        if l.strip() and not l.strip().startswith("File "):
+            last_line = l.strip()
+            break
+
+    exc_type = None
+    exc_msg = last_line
+    if ":" in last_line:
+        parts = last_line.split(":", 1)
+        if " " not in parts[0] or parts[0].startswith("psycopg2.") or parts[0].startswith("odoo.") or "Error" in parts[0]:
+            exc_type = parts[0].strip()
+            exc_msg = parts[1].strip()
+
+    originating_frame = None
+    custom_frames = [f for f in frames if f["is_custom_code"]]
+    if custom_frames:
+        originating_frame = custom_frames[-1]
+    elif frames:
+        originating_frame = frames[-1]
+
+    return {
+        "has_traceback": len(frames) > 0,
+        "total_frames": len(frames),
+        "frames": frames,
+        "originating_frame": originating_frame,
+        "exception_type": exc_type,
+        "exception_message": exc_msg,
+    }
+
+
 @mcp.tool()
 def analyze_odoo_error(error_text: str) -> dict:
-    """Analyze an Odoo error and suggest troubleshooting steps.
+    """Analyze an Odoo error, traceback, or browser console crash and suggest troubleshooting steps.
+
+    Parses Python server stack traces, PostgreSQL database constraint violations,
+    Owl 2 frontend crashes, XML data loading errors, and access permission faults.
 
     Args:
         error_text: The error message or traceback to investigate.
@@ -45,8 +108,144 @@ def analyze_odoo_error(error_text: str) -> dict:
         }
 
     error = error_text.lower()
+    traceback_info = _parse_odoo_traceback(error_text)
+    confirmed_diagnosis = False
+    extracted_details = {}
+    actionable_fix = None
 
-    if "external id not found" in error:
+    # 1. PostgreSQL NOT NULL constraint violation
+    not_null_match = re.search(
+        r'null value in column "(?P<col>[^"]+)" of relation "(?P<table>[^"]+)" violates not-null constraint',
+        error_text,
+        re.IGNORECASE,
+    )
+    if not_null_match:
+        category = "Database NOT NULL Constraint Error"
+        col = not_null_match.group("col")
+        tbl = not_null_match.group("table")
+        cause = f"Column '{col}' on table '{tbl}' has a NOT NULL database constraint, but a null value was passed during create/write."
+        steps = [
+            f"Check the Odoo model corresponding to table '{tbl}' and ensure field '{col}' is given a default value or passed in vals.",
+            f"If '{col}' is computed, verify that store=True compute method populates it for all records.",
+            f"If field is optional in business logic, remove required=True or drop the NOT NULL constraint in migration.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "not_null_constraint", "column": col, "table": tbl}
+        actionable_fix = f"Ensure field '{col}' is populated with a non-null value before saving to '{tbl}'."
+
+    # 2. PostgreSQL Unique key constraint violation
+    elif (unique_match := re.search(
+        r'duplicate key value violates unique constraint "(?P<constraint>[^"]+)"(?:\s*DETAIL:\s*Key \((?P<key>[^)]+)\)=\((?P<val>[^)]+)\) already exists)?',
+        error_text,
+        re.IGNORECASE,
+    )):
+        category = "Database Unique Constraint Error"
+        constraint = unique_match.group("constraint")
+        key = unique_match.group("key") or "field"
+        val = unique_match.group("val") or "value"
+        cause = f"Unique constraint '{constraint}' was violated because {key}={val} already exists in the database."
+        steps = [
+            f"Search existing records in Odoo for {key}={val} to identify the duplicate record.",
+            f"If this field uses an automated sequence (e.g. order number), ensure the sequence's next number exceeds existing values.",
+            f"Check model _sql_constraints definitions for conflicting unique constraints.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "unique_constraint", "constraint": constraint, "key": key, "value": val}
+        actionable_fix = f"Ensure unique value for '{key}'. Value '{val}' already exists in database."
+
+    # 3. PostgreSQL Foreign key violation
+    elif (fk_match := re.search(
+        r'violates foreign key constraint "(?P<constraint>[^"]+)" on table "(?P<table>[^"]+)"',
+        error_text,
+        re.IGNORECASE,
+    )):
+        category = "Database Foreign Key Error"
+        constraint = fk_match.group("constraint")
+        tbl = fk_match.group("table")
+        cause = f"Foreign key constraint '{constraint}' on table '{tbl}' was violated because a referenced relational ID does not exist."
+        steps = [
+            f"Check Many2one or relational field values being written to table '{tbl}'.",
+            "Verify that the referenced foreign record was not previously deleted.",
+            "Ensure database integrity before running bulk data imports.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "foreign_key_constraint", "constraint": constraint, "table": tbl}
+        actionable_fix = f"Verify that relational references in '{tbl}' point to existing records."
+
+    # 4. Owl Missing / Unregistered Component
+    elif (owl_comp_match := re.search(
+        r'(?:missing or unregistered component:?\s*["\']?(?P<comp>[a-zA-Z0-9_\.]+)["\']?|component "(?P<comp2>[^"]+)" is not registered)',
+        error_text,
+        re.IGNORECASE,
+    )):
+        cname = owl_comp_match.group("comp") or owl_comp_match.group("comp2") or "Component"
+        category = "Owl Component Registry Error"
+        cause = f"Owl component '{cname}' was referenced in a view or template but is not registered in the Odoo web registry."
+        steps = [
+            f"Verify that '{cname}' is registered in registry.category('views') or registry.category('fields').",
+            f"Ensure the JavaScript file defining '{cname}' starts with '/** @odoo-module **/'.",
+            f"Check manifest 'assets' dictionary: ensure the component JS file is listed under 'web.assets_backend'.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "owl_unregistered_component", "component": cname}
+        actionable_fix = f"Register '{cname}' in the web registry and declare in manifest assets['web.assets_backend']."
+
+    # 5. Owl Template Missing Error
+    elif (owl_tmpl_match := re.search(
+        r"(?:could not find template|template not found):?\s*['\"](?P<tmpl>[^'\"]+)['\"]",
+        error_text,
+        re.IGNORECASE,
+    )):
+        tname = owl_tmpl_match.group("tmpl")
+        category = "Owl Template Missing Error"
+        cause = f"QWeb template '{tname}' was not found by the Owl template compiler."
+        steps = [
+            f"Ensure `<t t-name='{tname}'>` is defined in a static/src/xml/*.xml file.",
+            "Ensure the XML template file is declared in the addon's manifest under 'assets' -> 'web.assets_backend'.",
+            "Clear browser cache and reload assets with debug=assets in the URL.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "owl_missing_template", "template": tname}
+        actionable_fix = f"Declare XML template '{tname}' in manifest assets['web.assets_backend']."
+
+    # 6. Owl Lifecycle Scope Error (env / ui of undefined)
+    elif (owl_env_match := re.search(
+        r"cannot read propert(?:y|ies) of undefined \(reading ['\"](?P<prop>env|ui|user|action|notification)['\"]\)",
+        error_text,
+        re.IGNORECASE,
+    )):
+        prop = owl_env_match.group("prop")
+        category = "Owl Lifecycle Scope Error"
+        cause = f"Attempted to access 'this.{prop}' on an uninitialized component or outside component setup() context."
+        steps = [
+            f"In Owl 2, access '{prop}' inside setup() using 'this.{prop}' or 'useService(\"{prop}\")'.",
+            "Do not access environment services in standard constructor or static methods before setup() runs.",
+            "If calling asynchronous methods, bind the component context or capture 'this' properly.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "owl_lifecycle_error", "property": prop}
+        actionable_fix = f"Access '{prop}' inside setup() via useService() or ensure component lifecycle is mounted."
+
+    # 7. Asset Bundle Compilation Error
+    elif (asset_match := re.search(
+        r"(?:could not compile scss|could not get content for|asset bundle error):?\s*(?P<asset>[^\n]+)",
+        error_text,
+        re.IGNORECASE,
+    )):
+        asset_path = asset_match.group("asset").strip()
+        category = "Asset Bundle Compilation Error"
+        cause = f"The asset bundle compiler failed while compiling: {asset_path}"
+        steps = [
+            f"Check '{asset_path}' for syntax errors, missing variables, or broken @import statements.",
+            "Verify file paths in manifest 'assets' dictionary.",
+            "Run with debug=assets in the URL to identify unminified failing lines.",
+        ]
+        confirmed_diagnosis = True
+        extracted_details = {"type": "asset_bundle_error", "asset": asset_path}
+        actionable_fix = f"Fix syntax or path in asset bundle: {asset_path}"
+
+    # 8. Standard Categories
+    elif "external id not found" in error:
         category = "XML ID Error"
         cause = (
             "A referenced external ID may be missing, incorrectly named, "
@@ -144,13 +343,27 @@ def analyze_odoo_error(error_text: str) -> dict:
             "Describe what you were doing when the error occurred.",
         ]
 
-    return {
+    result = {
         "success": True,
         "category": category,
         "possible_cause": cause,
         "troubleshooting_steps": steps,
-        "confirmed_diagnosis": False,
+        "confirmed_diagnosis": confirmed_diagnosis,
     }
+
+    if traceback_info.get("has_traceback"):
+        result["traceback_summary"] = {
+            "total_frames": traceback_info["total_frames"],
+            "originating_frame": traceback_info["originating_frame"],
+            "exception_type": traceback_info["exception_type"],
+            "exception_message": traceback_info["exception_message"],
+        }
+    if extracted_details:
+        result["extracted_details"] = extracted_details
+    if actionable_fix:
+        result["actionable_fix"] = actionable_fix
+
+    return result
 
 @mcp.tool()
 def inspect_odoo_module(
