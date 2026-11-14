@@ -2118,6 +2118,42 @@ def check_odoo_addon_health(
             "All static checks passed. The addon is ready for testing in an active Odoo instance."
         )
 
+    # Aggregated errors and warnings for easy consumption and reporting
+    all_errors = []
+    all_warnings = []
+
+    for mf in manifest_res.get("missing_fields", []):
+        all_errors.append({"file": "__manifest__.py", "code": "MISSING_REQUIRED_FIELD", "message": f"Missing required manifest field: {mf}"})
+    for mf in manifest_res.get("missing_files", []):
+        all_errors.append({"file": "__manifest__.py", "code": "MISSING_DECLARED_FILE", "message": f"Referenced file not found on disk: {mf}"})
+    if manifest_res.get("syntax_error"):
+        all_errors.append({"file": "__manifest__.py", "code": "MANIFEST_SYNTAX_ERROR", "message": manifest_res["syntax_error"]})
+
+    for v in views_audit:
+        for err in v.get("errors", []):
+            all_errors.append({"file": v["file"], "line": err.get("line"), "code": err.get("code"), "message": err.get("message")})
+        for warn in v.get("warnings", []):
+            all_warnings.append({"file": v["file"], "line": warn.get("line"), "code": warn.get("code"), "message": warn.get("message")})
+
+    for m in models_audit:
+        for err in m.get("errors", []):
+            all_errors.append({"file": m["file"], "line": err.get("line"), "code": err.get("code"), "message": err.get("message")})
+        for warn in m.get("warnings", []):
+            all_warnings.append({"file": m["file"], "line": warn.get("line"), "code": warn.get("code"), "message": warn.get("message")})
+
+    for s in security_audit:
+        for err in s.get("errors", []):
+            all_errors.append({"file": s["file"], "line": err.get("line"), "code": err.get("code"), "message": err.get("message")})
+        for warn in s.get("warnings", []):
+            all_warnings.append({"file": s["file"], "line": warn.get("line"), "code": warn.get("code"), "message": warn.get("message")})
+
+    for cf in cross_file_issues:
+        item = {"file": cf.get("file", "cross-file"), "line": cf.get("line"), "code": cf.get("code"), "message": cf.get("message")}
+        if cf.get("severity") == "error":
+            all_errors.append(item)
+        else:
+            all_warnings.append(item)
+
     return {
         "success": True,
         "addon_name": resolved_addon.name,
@@ -2129,6 +2165,8 @@ def check_odoo_addon_health(
             "total_warnings": total_warnings,
             "cross_file_issues": len(cross_file_issues),
         },
+        "errors": all_errors,
+        "warnings": all_warnings,
         "audit_breakdown": {
             "manifest": {
                 "valid": manifest_valid,
@@ -4921,19 +4959,34 @@ def format_cli_report(result: dict, title: str) -> str:
     if errors:
         lines.append(f"\nErrors ({len(errors)}):")
         for err in errors:
-            line_info = f" [Line {err['line']}]" if err.get("line") else ""
+            file_part = f"[{err['file']}]" if err.get("file") else ""
+            if err.get("file") and err.get("line"):
+                loc_info = f" [{err['file']}:Line {err['line']}]"
+            elif err.get("file"):
+                loc_info = f" [{err['file']}]"
+            elif err.get("line"):
+                loc_info = f" [Line {err['line']}]"
+            else:
+                loc_info = ""
             msg = err.get("message", str(err))
             code = f"{err['code']}: " if err.get("code") else ""
-            lines.append(f"  [ERROR]{line_info} {code}{msg}")
+            lines.append(f"  [ERROR]{loc_info} {code}{msg}")
 
     warnings = result.get("warnings", [])
     if warnings:
         lines.append(f"\nWarnings ({len(warnings)}):")
         for warn in warnings:
-            line_info = f" [Line {warn['line']}]" if warn.get("line") else ""
+            if warn.get("file") and warn.get("line"):
+                loc_info = f" [{warn['file']}:Line {warn['line']}]"
+            elif warn.get("file"):
+                loc_info = f" [{warn['file']}]"
+            elif warn.get("line"):
+                loc_info = f" [Line {warn['line']}]"
+            else:
+                loc_info = ""
             msg = warn.get("message", str(warn))
             code = f"{warn['code']}: " if warn.get("code") else ""
-            lines.append(f"  [WARN]{line_info} {code}{msg}")
+            lines.append(f"  [WARN]{loc_info} {code}{msg}")
 
     cross_file = result.get("cross_file_issues", [])
     if cross_file:
@@ -4987,23 +5040,79 @@ def cli_check(
             if fail_on_warning and status != "HEALTHY":
                 return 1
             return 0
-        else:
-            js_or_xml = list(target.glob("**/*.js")) + list(target.glob("**/*.xml"))
-            if js_or_xml:
-                res = analyze_odoo_owl_component(str(target))
-                if not res.get("success"):
-                    print(f"[ERROR] {res.get('error')}", file=sys.stderr)
-                    return 2
-                report = format_cli_report(res, f"OWL Component Audit ({target.name})")
-                print(report)
-                if res.get("errors"):
-                    return 1
-                if fail_on_warning and res.get("warnings"):
-                    return 1
-                return 0
-            else:
-                print(f"[ERROR] Directory is not an Odoo addon (no __manifest__.py found): {target}", file=sys.stderr)
+
+        # Check if target is a multi-addon directory (containing multiple Odoo modules)
+        child_addons = sorted([
+            d for d in target.iterdir()
+            if d.is_dir() and not d.name.startswith(".") and (d / "__manifest__.py").is_file()
+        ])
+        if child_addons:
+            overall_code = 0
+            for child in child_addons:
+                c_res = check_odoo_addon_health(str(child), addons_directories=addons_dirs)
+                if not c_res.get("success"):
+                    print(f"[ERROR] {child.name}: {c_res.get('error')}", file=sys.stderr)
+                    overall_code = 1
+                    continue
+                print(format_cli_report(c_res, f"Addon Health Check ({child.name})"))
+                c_status = c_res.get("health_status") or c_res.get("status")
+                if c_status == "CRITICAL_ISSUES":
+                    overall_code = 1
+                elif fail_on_warning and c_status != "HEALTHY":
+                    overall_code = 1
+            return overall_code
+
+        # Check if target is a subfolder containing models (*.py)
+        py_files = sorted([f for f in target.glob("**/*.py") if f.name != "__init__.py"])
+        if py_files and target.name == "models":
+            overall_code = 0
+            for py_f in py_files:
+                p_res = analyze_odoo_python_model(str(py_f))
+                if not p_res.get("success"):
+                    print(f"[ERROR] {py_f.name}: {p_res.get('error')}", file=sys.stderr)
+                    overall_code = 1
+                    continue
+                print(format_cli_report(p_res, f"Python Model Analysis ({py_f.name})"))
+                if p_res.get("errors"):
+                    overall_code = 1
+                elif fail_on_warning and p_res.get("warnings"):
+                    overall_code = 1
+            return overall_code
+
+        # Check if target contains JS files
+        js_files = list(target.glob("**/*.js"))
+        if js_files:
+            res = analyze_odoo_owl_component(str(target))
+            if not res.get("success"):
+                print(f"[ERROR] {res.get('error')}", file=sys.stderr)
                 return 2
+            report = format_cli_report(res, f"OWL Component Audit ({target.name})")
+            print(report)
+            if res.get("errors"):
+                return 1
+            if fail_on_warning and res.get("warnings"):
+                return 1
+            return 0
+
+        # Check if target contains XML views
+        xml_files = sorted(list(target.glob("**/*.xml")))
+        if xml_files:
+            overall_code = 0
+            for xml_f in xml_files:
+                x_res = analyze_odoo_xml_view(str(xml_f))
+                if not x_res.get("success"):
+                    print(f"[ERROR] {xml_f.name}: {x_res.get('error')}", file=sys.stderr)
+                    overall_code = 1
+                    continue
+                print(format_cli_report(x_res, f"XML View Analysis ({xml_f.name})"))
+                if x_res.get("errors"):
+                    overall_code = 1
+                elif fail_on_warning and x_res.get("warnings"):
+                    overall_code = 1
+            return overall_code
+
+        print(f"[ERROR] Directory is not an Odoo addon (no __manifest__.py found): {target}", file=sys.stderr)
+        return 2
 
     ext = target.suffix.lower()
     if ext == ".xml":
